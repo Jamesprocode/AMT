@@ -1,9 +1,13 @@
 *.mid
 *.wav
 model/
+<<<<<<< HEAD
 
 # Python cache
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+=======
+*.png
+>>>>>>> 252f1c98613f83b95b88abfc115b1222b3da76e7

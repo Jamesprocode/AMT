@@ -66,8 +66,10 @@ def extract_instruments(all_events, instruments):
         if instr in instruments:
             # mark this event as a control
             controls.extend([CONTROL_OFFSET+time, CONTROL_OFFSET+dur, CONTROL_OFFSET+note])
+            print(f"Instrument {instr} is in the subset; marking note {note} as a control")
         else:
             events.extend([time, dur, note])
+            print(f"Instrument {instr} is not in the subset; marking note {note} as an event")
 
     return events, controls
 
