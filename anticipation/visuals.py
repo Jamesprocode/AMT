@@ -11,7 +11,7 @@ import anticipation.ops as ops
 from anticipation.config import *
 from anticipation.vocab import *
 
-def visualize(tokens, output, selected=None):
+def visualize(tokens, output=None, selected=None):
     #colors = ['white', 'silver', 'red', 'sienna', 'darkorange', 'gold', 'yellow', 'palegreen', 'seagreen', 'cyan',
     #          'dodgerblue', 'slategray', 'navy', 'mediumpurple', 'mediumorchid', 'magenta', 'lightpink']
     colors = ['white', '#426aa0', '#b26789', '#de9283', '#eac29f', 'silver', 'red', 'sienna', 'darkorange', 'gold', 'yellow', 'palegreen', 'seagreen', 'cyan', 'dodgerblue', 'slategray', 'navy']
@@ -62,4 +62,5 @@ def visualize(tokens, output, selected=None):
     plt.legend(handles=patches, bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0. )
 
     plt.tight_layout()
-    plt.savefig(output)
+    if output:
+        plt.savefig(output)
