@@ -394,8 +394,8 @@ def main():
     # args = parser.parse_args()
 
     model_path = 'model/music-small-800k'
-    client_ip = "127.0.0.1"
-    listen_ip = "127.0.0.1"
+    client_ip = "192.168.1.2"
+    listen_ip = "192.168.1.10"
     client_port = 9001
     listen_port = 9000
 
@@ -405,7 +405,7 @@ def main():
         listen_port   = listen_port,
         client_ip     = client_ip,
         client_port   = client_port,
-        window_size   = 2.0,
+        window_size   = 6.0,
         top_p         = 0.95,
         temperature   = 1.0,
     )
