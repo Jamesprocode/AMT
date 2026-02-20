@@ -144,13 +144,17 @@ def events_to_schedule(events: list[int], play_start: float, win_start: float = 
         pitch      = note_v  % MAX_PITCH
 
         # skip percussion (instrument 128)
-        if instrument == 128:
-            continue
+        # if instrument == 128:
+        #     continue
 
         t_sec  = t_bins / TIME_RESOLUTION
         d_sec  = max(0.05, d_bins / TIME_RESOLUTION)
 
-        channel = 2  # all generated notes on channel 2
+        # channel = 2  # all generated notes on channel 2
+
+
+        #saving a version to play full instrument channel
+        channel = (instrument % 15) + 2
 
         on_time  = play_start + (t_sec - win_start)
         off_time = on_time + d_sec
@@ -401,7 +405,7 @@ def main():
         listen_port   = listen_port,
         client_ip     = client_ip,
         client_port   = client_port,
-        window_size   = 4.0,
+        window_size   = 2.0,
         top_p         = 0.95,
         temperature   = 1.0,
     )
