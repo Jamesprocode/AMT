@@ -180,7 +180,7 @@ class JamServer:
     ):
         log.info("Loading model from %s …", model_path)
         device = torch.device("cuda:1")
-        self.model = AutoModelForCausalLM.from_pretrained(model_path).cuda()
+        self.model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
         self.model.eval()
         log.info("Model ready on %s", next(self.model.parameters()).device)
 
@@ -337,16 +337,18 @@ def main():
     args = parser.parse_args()
 
     model_path = 'model/music-small-800k'
+    client_ip = "143.215.16.231"
+    client_port = 9001
 
     server = JamServer(
         model_path    = model_path,
         listen_ip     = args.listen_ip,
         listen_port   = args.listen_port,
-        client_ip     = args.client_ip,
-        client_port   = args.client_port,
-        window_size   = args.window,
-        top_p         = args.top_p,
-        temperature   = args.temperature,
+        client_ip     = client_ip,
+        client_port   = client_port,
+        window_size   = 6.0,
+        top_p         = 0.95,
+        temperature   = 1.0,
     )
     server.run()
 
