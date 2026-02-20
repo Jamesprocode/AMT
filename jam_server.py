@@ -38,12 +38,8 @@ from pythonosc.udp_client import SimpleUDPClient
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from anticipation import ops
-from anticipation.config import TIME_RESOLUTION, MAX_PITCH, MAX_DUR, MAX_TIME, DELTA
-from anticipation.vocab import (
-    TIME_OFFSET, DUR_OFFSET, NOTE_OFFSET,
-    ATIME_OFFSET, ADUR_OFFSET, ANOTE_OFFSET,
-    CONTROL_OFFSET,
-)
+from anticipation.config import TIME_RESOLUTION, MAX_PITCH, MAX_DUR, MAX_TIME
+from anticipation.vocab import TIME_OFFSET, DUR_OFFSET, NOTE_OFFSET
 from anticipation.sample import generate
 
 logging.basicConfig(
@@ -85,8 +81,7 @@ class NoteBuffer:
                     self._done.append((on_t, dur, pitch, instrument))
 
     def collect_window(self, t_start: float, t_end: float) -> list[tuple]:
-        """Return completed notes whose note-on fell in [t_start, t_end].
-        Also closes any still-pending notes using t_end as note-off time."""
+        """Return completed notes whose note-on fell in [t_start, t_end], window-relative times."""
         with self._lock:
             notes = []
             for (t, dur, pitch, instr) in self._done:
@@ -109,32 +104,31 @@ class NoteBuffer:
 
 # ── Token helpers ─────────────────────────────────────────────────────────────
 
-def notes_to_controls(notes: list[tuple]) -> list[int]:
-    """Convert (t_rel, dur, pitch, instrument) list → AMT control tokens.
+def notes_to_events(notes: list[tuple]) -> list[int]:
+    """Convert (t_rel, dur, pitch, instrument) list → regular AMT event tokens.
 
-    Times are relative to the window start (0..window_size).
-    We shift them by DELTA so they appear as 'future' events the model
-    will anticipate while generating [0, window_size].
+    Passed as inputs= so the model treats them as already-happened music
+    and generates a continuation for the next window.
     """
-    controls = []
+    events = []
     for (t, dur, pitch, instr) in notes:
-        t_shifted = t + DELTA                              # push into future
-        t_bins  = min(int(t_shifted * TIME_RESOLUTION), MAX_TIME - 1)
-        d_bins  = min(int(dur       * TIME_RESOLUTION), MAX_DUR  - 1)
-        note_v  = pitch + instr * MAX_PITCH
-        controls.extend([
-            ATIME_OFFSET + t_bins,
-            ADUR_OFFSET  + d_bins,
-            ANOTE_OFFSET + note_v,
+        t_bins = min(int(t * TIME_RESOLUTION), MAX_TIME - 1)
+        d_bins = min(int(dur * TIME_RESOLUTION), MAX_DUR - 1)
+        note_v = pitch + instr * MAX_PITCH
+        events.extend([
+            TIME_OFFSET + t_bins,
+            DUR_OFFSET  + d_bins,
+            NOTE_OFFSET + note_v,
         ])
-    return ops.sort(controls)
+    return ops.sort(events)
 
 
-def events_to_schedule(events: list[int], play_start: float) -> list[tuple]:
+def events_to_schedule(events: list[int], play_start: float, win_start: float = 0.0) -> list[tuple]:
     """Convert AMT event tokens → sorted list of (wall_time, address, args).
 
-    Returns both noteon and noteoff entries so Max/MSP just plays them
-    as they arrive with no additional scheduling needed.
+    play_start : wall-clock time to begin playback
+    win_start  : session time (seconds) of the window start; subtracted so
+                 events with absolute session times play relative to play_start.
     """
     schedule = []
     for i in range(0, len(events), 3):
@@ -153,7 +147,7 @@ def events_to_schedule(events: list[int], play_start: float) -> list[tuple]:
         # Map instrument → MIDI channel 2-16 (channel 1 reserved for human)
         channel = (instrument % 15) + 2
 
-        on_time  = play_start + t_sec
+        on_time  = play_start + (t_sec - win_start)
         off_time = on_time + d_sec
 
         schedule.append((on_time,  "/gen/noteon",  [pitch, 80, channel]))
@@ -179,7 +173,7 @@ class JamServer:
         human_instrument: int = 0,
     ):
         log.info("Loading model from %s …", model_path)
-        device = torch.device("cuda:1")
+        device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
         self.model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
         self.model.eval()
         log.info("Model ready on %s", next(self.model.parameters()).device)
@@ -198,7 +192,17 @@ class JamServer:
 
     # ── OSC handlers ──────────────────────────────────────────────────────────
 
+    def _on_any(self, address, *args):
+        """Catch-all: log every OSC message that arrives."""
+        log.info("OSC IN  %s  args=%s", address, args)
+
     def _on_note(self, address, pitch, velocity):
+        label = "ON " if int(velocity) > 0 else "OFF"
+        log.info("MIDI %s  pitch=%d  vel=%d", label, int(pitch), int(velocity))
+        # auto-start session on first note if not already running
+        if not self._running:
+            log.info("Auto-starting session on first note")
+            self._on_start(address)
         self.buffer.note_event(int(pitch), int(velocity), self.human_instrument)
 
     def _on_start(self, address, *args):
@@ -217,6 +221,20 @@ class JamServer:
         self.client.send_message("/gen/status", ["session stopped"])
         log.info("Session stopped")
 
+    def _on_test(self, address, *args):
+        """Send a C major arpeggio to verify the return path works."""
+        log.info("TEST: sending notes to %s:%d …", self.client._address, self.client._port)
+        test_notes = [60, 64, 67, 72]  # C4 E4 G4 C5
+        def _fire():
+            for i, pitch in enumerate(test_notes):
+                time.sleep(i * 0.3)
+                self.client.send_message("/gen/noteon",  [pitch, 100, 2])
+                log.info("TEST → /gen/noteon [pitch=%d vel=100 ch=2]", pitch)
+                time.sleep(0.25)
+                self.client.send_message("/gen/noteoff", [pitch, 2])
+            log.info("TEST done")
+        threading.Thread(target=_fire, daemon=True).start()
+
     def _on_window_size(self, address, value):
         self.window_size = float(value)
         log.info("window_size → %.2f s", self.window_size)
@@ -233,6 +251,7 @@ class JamServer:
 
     def _generation_loop(self):
         window_num = 0
+
         while self._running:
             # wait for one full window of human input
             time.sleep(self.window_size)
@@ -251,18 +270,29 @@ class JamServer:
                 window_num += 1
                 continue
 
-            log.info("Window %d: %d notes captured – generating …", window_num, len(notes))
+            log.info("Window %d: %d notes – generating …", window_num, len(notes))
             t_gen_start = time.time()
 
             try:
-                controls  = notes_to_controls(notes)
+                prompt = notes_to_events(notes)
+
+                note_names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
+                log.info("── PROMPT ────────────────────────────────────────")
+                for (t, dur, pitch, instr) in sorted(notes, key=lambda x: x[0]):
+                    name = note_names[pitch % 12] + str(pitch // 12 - 1)
+                    log.info("  t=%5.2fs  dur=%.2fs  %s (pitch=%d  instr=%d)",
+                             t, dur, name, pitch, instr)
+                log.info("  %d notes → continuation [%.1f, %.1f]s",
+                         len(notes), self.window_size, self.window_size * 2)
+                log.info("─────────────────────────────────────────────────")
+
                 with torch.no_grad():
                     events = generate(
                         self.model,
-                        start_time  = 0,
-                        end_time    = self.window_size,
-                        inputs      = [],
-                        controls    = controls,
+                        start_time  = self.window_size,
+                        end_time    = self.window_size * 2,
+                        inputs      = prompt,
+                        controls    = [],
                         top_p       = self.top_p,
                         temperature = self.temperature,
                     )
@@ -272,13 +302,17 @@ class JamServer:
                 window_num += 1
                 continue
 
+            # clip to just the new continuation window
+            continuation = ops.clip(events, self.window_size, self.window_size * 2,
+                                    clip_duration=False, seconds=True)
+
             gen_elapsed = time.time() - t_gen_start
-            n_events = len(events) // 3
+            n_events = len(continuation) // 3
             log.info("Window %d: generated %d events in %.2fs", window_num, n_events, gen_elapsed)
 
-            # play back starting NOW (generation time is the only latency)
+            # play back starting NOW; subtract window_size offset from token times
             play_start = time.time()
-            schedule   = events_to_schedule(events, play_start)
+            schedule   = events_to_schedule(continuation, play_start, self.window_size)
             threading.Thread(
                 target=self._playback_thread,
                 args=(schedule,),
@@ -288,11 +322,15 @@ class JamServer:
             window_num += 1
 
     def _playback_thread(self, schedule: list[tuple]):
+        log.info("Playback: sending %d OSC messages to %s:%d",
+                 len(schedule), self.client._address, self.client._port)
         for (target_time, address, args) in schedule:
             now = time.time()
             if target_time > now:
                 time.sleep(target_time - now)
+            log.info("  → %s %s", address, args)
             self.client.send_message(address, args)
+        log.info("Playback: done")
 
     # ── Start OSC server ──────────────────────────────────────────────────────
 
@@ -304,6 +342,8 @@ class JamServer:
         disp.map("/control/window_size",    self._on_window_size)
         disp.map("/control/top_p",          self._on_top_p)
         disp.map("/control/temperature",    self._on_temperature)
+        disp.map("/control/test",           self._on_test)
+        disp.set_default_handler(self._on_any)
 
         server = osc_server.ThreadingOSCUDPServer(
             (self.listen_ip, self.listen_port), disp
@@ -311,39 +351,53 @@ class JamServer:
         log.info("OSC server listening on %s:%d", self.listen_ip, self.listen_port)
         log.info("Sending generated notes to %s:%d",
                  self.client._address, self.client._port)
+        threading.Thread(target=self._startup_test, daemon=True).start()
         server.serve_forever()
+
+    def _startup_test(self):
+        time.sleep(2.0)
+        log.info("STARTUP TEST: firing C major arpeggio to %s:%d",
+                 self.client._address, self.client._port)
+        for pitch in [60, 64, 67, 72]:
+            self.client.send_message("/gen/noteon",  [pitch, 100, 2])
+            log.info("  → /gen/noteon [pitch=%d vel=100 ch=2]", pitch)
+            time.sleep(0.3)
+            self.client.send_message("/gen/noteoff", [pitch, 2])
+        log.info("STARTUP TEST done – if Max heard 4 notes the return path is working")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="AMT real-time jam server")
-    parser.add_argument("--listen-ip",   default="0.0.0.0",
-                        help="IP to bind OSC server (default 0.0.0.0)")
-    parser.add_argument("--listen-port", type=int, default=9000,
-                        help="UDP port to listen on (default 9000)")
-    parser.add_argument("--client-ip",   required=True,
-                        help="Public IP of the local machine to send generated notes to")
-    parser.add_argument("--client-port", type=int, default=9001,
-                        help="UDP port on local machine (default 9001)")
-    parser.add_argument("--model",       default="../model/music-small-800k",
-                        help="Path to model checkpoint (default model/music-small-800k)")
-    parser.add_argument("--window",      type=float, default=6.0,
-                        help="Window size in seconds (default 6.0)")
-    parser.add_argument("--top-p",       type=float, default=0.95,
-                        help="Nucleus sampling p (default 0.95)")
-    parser.add_argument("--temperature", type=float, default=1.0,
-                        help="Sampling temperature (default 1.0)")
-    args = parser.parse_args()
+    # parser = argparse.ArgumentParser(description="AMT real-time jam server")
+    # parser.add_argument("--listen-ip",   default="0.0.0.0",
+    #                     help="IP to bind OSC server (default 0.0.0.0)")
+    # parser.add_argument("--listen-port", type=int, default=9000,
+    #                     help="UDP port to listen on (default 9000)")
+    # parser.add_argument("--client-ip",   required=True,
+    #                     help="Public IP of the local machine to send generated notes to")
+    # parser.add_argument("--client-port", type=int, default=9001,
+    #                     help="UDP port on local machine (default 9001)")
+    # parser.add_argument("--model",       default="../model/music-small-800k",
+    #                     help="Path to model checkpoint (default model/music-small-800k)")
+    # parser.add_argument("--window",      type=float, default=6.0,
+    #                     help="Window size in seconds (default 6.0)")
+    # parser.add_argument("--top-p",       type=float, default=0.95,
+    #                     help="Nucleus sampling p (default 0.95)")
+    # parser.add_argument("--temperature", type=float, default=1.0,
+    #                     help="Sampling temperature (default 1.0)")
+    # args = parser.parse_args()
 
     model_path = 'model/music-small-800k'
-    client_ip = "143.215.16.231"
+    client_ip = "127.0.0.1"
+    listen_ip = "127.0.0.1"
     client_port = 9001
+    listen_port = 9000
 
     server = JamServer(
         model_path    = model_path,
-        listen_ip     = args.listen_ip,
-        listen_port   = args.listen_port,
+        listen_ip     = listen_ip,
+        listen_port   = listen_port,
         client_ip     = client_ip,
         client_port   = client_port,
         window_size   = 6.0,
