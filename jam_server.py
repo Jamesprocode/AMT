@@ -38,8 +38,8 @@ from pythonosc.udp_client import SimpleUDPClient
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from anticipation import ops
-from anticipation.config import TIME_RESOLUTION, MAX_PITCH, MAX_DUR, MAX_TIME
-from anticipation.vocab import TIME_OFFSET, DUR_OFFSET, NOTE_OFFSET
+from anticipation.config import TIME_RESOLUTION, MAX_PITCH, MAX_DUR, MAX_TIME, DELTA
+from anticipation.vocab import TIME_OFFSET, DUR_OFFSET, NOTE_OFFSET, ATIME_OFFSET, ADUR_OFFSET, ANOTE_OFFSET
 from anticipation.sample import generate
 
 logging.basicConfig(
@@ -104,23 +104,24 @@ class NoteBuffer:
 
 # ── Token helpers ─────────────────────────────────────────────────────────────
 
-def notes_to_events(notes: list[tuple]) -> list[int]:
-    """Convert (t_rel, dur, pitch, instrument) list → regular AMT event tokens.
+def notes_to_controls(notes: list[tuple]) -> list[int]:
+    """Convert (t_rel, dur, pitch, instrument) list → anticipatory control tokens.
 
-    Passed as inputs= so the model treats them as already-happened music
-    and generates a continuation for the next window.
+    Each note is shifted forward by DELTA seconds so the model sees them as
+    future constraints and generates accompaniment for the same [0, window_size].
     """
-    events = []
+    controls = []
     for (t, dur, pitch, instr) in notes:
-        t_bins = min(int(t * TIME_RESOLUTION), MAX_TIME - 1)
+        t_shifted = t + DELTA
+        t_bins = min(int(t_shifted * TIME_RESOLUTION), MAX_TIME - 1)
         d_bins = min(int(dur * TIME_RESOLUTION), MAX_DUR - 1)
         note_v = pitch + instr * MAX_PITCH
-        events.extend([
-            TIME_OFFSET + t_bins,
-            DUR_OFFSET  + d_bins,
-            NOTE_OFFSET + note_v,
+        controls.extend([
+            ATIME_OFFSET + t_bins,
+            ADUR_OFFSET  + d_bins,
+            ANOTE_OFFSET + note_v,
         ])
-    return ops.sort(events)
+    return ops.sort(controls)
 
 
 def events_to_schedule(events: list[int], play_start: float, win_start: float = 0.0) -> list[tuple]:
@@ -141,11 +142,15 @@ def events_to_schedule(events: list[int], play_start: float, win_start: float = 
 
         instrument = note_v // MAX_PITCH
         pitch      = note_v  % MAX_PITCH
+
+        # skip percussion (instrument 128)
+        if instrument == 128:
+            continue
+
         t_sec  = t_bins / TIME_RESOLUTION
         d_sec  = max(0.05, d_bins / TIME_RESOLUTION)
 
-        # Map instrument → MIDI channel 2-16 (channel 1 reserved for human)
-        channel = (instrument % 15) + 2
+        channel = 2  # all generated notes on channel 2
 
         on_time  = play_start + (t_sec - win_start)
         off_time = on_time + d_sec
@@ -274,25 +279,25 @@ class JamServer:
             t_gen_start = time.time()
 
             try:
-                prompt = notes_to_events(notes)
+                controls = notes_to_controls(notes)
 
                 note_names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
-                log.info("── PROMPT ────────────────────────────────────────")
+                log.info("── CONTROLS ──────────────────────────────────────")
                 for (t, dur, pitch, instr) in sorted(notes, key=lambda x: x[0]):
                     name = note_names[pitch % 12] + str(pitch // 12 - 1)
                     log.info("  t=%5.2fs  dur=%.2fs  %s (pitch=%d  instr=%d)",
                              t, dur, name, pitch, instr)
-                log.info("  %d notes → continuation [%.1f, %.1f]s",
-                         len(notes), self.window_size, self.window_size * 2)
+                log.info("  %d notes → accompaniment [0, %.1f]s",
+                         len(notes), self.window_size)
                 log.info("─────────────────────────────────────────────────")
 
                 with torch.no_grad():
                     events = generate(
                         self.model,
-                        start_time  = self.window_size,
-                        end_time    = self.window_size * 2,
-                        inputs      = prompt,
-                        controls    = [],
+                        start_time  = 0,
+                        end_time    = self.window_size,
+                        inputs      = [],
+                        controls    = controls,
                         top_p       = self.top_p,
                         temperature = self.temperature,
                     )
@@ -302,17 +307,13 @@ class JamServer:
                 window_num += 1
                 continue
 
-            # clip to just the new continuation window
-            continuation = ops.clip(events, self.window_size, self.window_size * 2,
-                                    clip_duration=False, seconds=True)
-
             gen_elapsed = time.time() - t_gen_start
-            n_events = len(continuation) // 3
+            n_events = len(events) // 3
             log.info("Window %d: generated %d events in %.2fs", window_num, n_events, gen_elapsed)
 
-            # play back starting NOW; subtract window_size offset from token times
+            # play back starting NOW
             play_start = time.time()
-            schedule   = events_to_schedule(continuation, play_start, self.window_size)
+            schedule   = events_to_schedule(events, play_start, 0.0)
             threading.Thread(
                 target=self._playback_thread,
                 args=(schedule,),
@@ -400,7 +401,7 @@ def main():
         listen_port   = listen_port,
         client_ip     = client_ip,
         client_port   = client_port,
-        window_size   = 6.0,
+        window_size   = 4.0,
         top_p         = 0.95,
         temperature   = 1.0,
     )
