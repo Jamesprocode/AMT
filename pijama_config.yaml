@@ -1,0 +1,24 @@
+# ── Data paths ────────────────────────────────────────────────────────────────
+data_dir: PiJAMa/midi_kong      # folder to read .midi files from (midi or midi_kong)
+output_dir: data/pijama         # where train.txt / valid.txt are written
+
+# ── Preprocessing ─────────────────────────────────────────────────────────────
+augment_factor: 1               # 1 = autoregressive only
+                                # 10 = full anticipation augmentation (spans + random)
+seed: 42
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model: model/music-medium-800k   # HF model ID or local checkpoint path
+lora: true                               # true = LoRA (~8GB VRAM), false = full finetune (~24GB)
+checkpoint_dir: checkpoints/pijama      # where to save checkpoints
+resume_from_checkpoint: null            # set to a checkpoint path to resume, e.g. checkpoints/pijama/checkpoint-1000
+
+# ── Training hyperparameters ──────────────────────────────────────────────────
+epochs: 10
+batch_size: 4                   # per-device; reduce to 2 if OOM
+grad_accum: 8                   # effective batch = batch_size * grad_accum (default: 32)
+lr: 1.0e-5                      # much lower than original 3e-4 to avoid catastrophic forgetting
+
+# ── W&B ───────────────────────────────────────────────────────────────────────
+wandb_project: amt-pijama
+wandb_run: null                 # null = auto-generated name
