@@ -11,11 +11,10 @@ Usage:
 import os
 import yaml
 
-# Patch for huggingface_hub >= 1.0 which moved is_offline_mode out of the top-level namespace
+# Patch for huggingface_hub versions that don't expose is_offline_mode at the top level
 import huggingface_hub
 if not hasattr(huggingface_hub, 'is_offline_mode'):
-    from huggingface_hub.utils import is_offline_mode
-    huggingface_hub.is_offline_mode = is_offline_mode
+    huggingface_hub.is_offline_mode = lambda: True
 
 import torch
 import wandb
