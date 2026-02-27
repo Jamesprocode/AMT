@@ -13,5 +13,6 @@ dependencies:
   - pip:
       - transformers>=5.2.0
       - accelerate>=0.34.0
+      - peft>=0.10.0
       - midi2audio==0.1.1
       - python-osc

@@ -28,6 +28,7 @@ import threading
 import argparse
 from pathlib import Path
 
+import json
 import torch
 from transformers import AutoModelForCausalLM
 from pythonosc import dispatcher as osc_dispatcher
@@ -50,6 +51,29 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+# ── Model loader (handles full checkpoints and LoRA adapters) ─────────────────
+
+def _load_model(model_path: str, device: torch.device):
+    adapter_cfg_path = Path(model_path) / "adapter_config.json"
+    if adapter_cfg_path.exists():
+        from peft import PeftModel
+        with open(adapter_cfg_path) as f:
+            adapter_cfg = json.load(f)
+        base_path = adapter_cfg["base_model_name_or_path"]
+        if not Path(base_path).exists():
+            # fall back: look for the base model next to the adapter directory
+            base_path = str(Path(model_path).parent / "music-medium-800k")
+            log.warning("adapter base path not found; trying %s", base_path)
+        log.info("LoRA adapter – loading base model from %s …", base_path)
+        base = AutoModelForCausalLM.from_pretrained(base_path).to(device)
+        log.info("Applying LoRA weights from %s …", model_path)
+        model = PeftModel.from_pretrained(base, model_path)
+        model = model.merge_and_unload()
+        log.info("LoRA weights merged into base model")
+        return model
+    return AutoModelForCausalLM.from_pretrained(model_path).to(device)
 
 
 # ── Note buffer ──────────────────────────────────────────────────────────────
@@ -198,7 +222,7 @@ class JamServer:
     ):
         log.info("Loading model from %s …", model_path)
         device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-        self.model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
+        self.model = _load_model(model_path, device)
         self.model.eval()
         log.info("Model ready on %s", next(self.model.parameters()).device)
 
