@@ -473,17 +473,33 @@ class JamServer:
             n_events = len(continuation) // 3
             log.info("Window %d: generated %d events in %.2fs", window_num, n_events, gen_elapsed)
 
-            # decode → transform → schedule
+            # decode → transform → schedule  (with per-step latency logging)
             play_start = time.time()
-            decoded  = decode_events(continuation)
-            decoded  = octave_fold(decoded, self.pitch_lo, self.pitch_hi)
-            decoded  = expand_tremolo(decoded, self.max_note_dur_s,
-                                      self.tremolo_rate, self.tremolo_strike_dur_ms)
-            decoded  = stagger_chords(decoded, self.stagger_ms)
-            decoded  = nudge_runs(decoded, self.run_interval_ms, self.run_semitones)
-            decoded  = filter_notes(decoded, self.min_note_dist_ms, self.max_notes_per_onset)
-            log.info("Window %d: %d notes after processing", window_num, len(decoded))
-            schedule = notes_to_schedule(decoded, play_start, self.window_size)
+            t0 = time.time()
+
+            decoded    = decode_events(continuation)
+            t1 = time.time(); log.info("  pipeline  decode_events  : %5.3f ms  (%d notes)", (t1-t0)*1e3, len(decoded))
+
+            decoded    = octave_fold(decoded, self.pitch_lo, self.pitch_hi)
+            t2 = time.time(); log.info("  pipeline  octave_fold    : %5.3f ms", (t2-t1)*1e3)
+
+            decoded    = expand_tremolo(decoded, self.max_note_dur_s,
+                                        self.tremolo_rate, self.tremolo_strike_dur_ms)
+            t3 = time.time(); log.info("  pipeline  expand_tremolo : %5.3f ms  (%d notes)", (t3-t2)*1e3, len(decoded))
+
+            decoded    = stagger_chords(decoded, self.stagger_ms)
+            t4 = time.time(); log.info("  pipeline  stagger_chords : %5.3f ms", (t4-t3)*1e3)
+
+            decoded    = nudge_runs(decoded, self.run_interval_ms, self.run_semitones)
+            t5 = time.time(); log.info("  pipeline  nudge_runs     : %5.3f ms", (t5-t4)*1e3)
+
+            decoded    = filter_notes(decoded, self.min_note_dist_ms, self.max_notes_per_onset)
+            t6 = time.time(); log.info("  pipeline  filter_notes   : %5.3f ms  (%d notes)", (t6-t5)*1e3, len(decoded))
+
+            schedule   = notes_to_schedule(decoded, play_start, self.window_size)
+            t7 = time.time(); log.info("  pipeline  notes_to_sched : %5.3f ms", (t7-t6)*1e3)
+
+            log.info("  pipeline  TOTAL          : %5.3f ms", (t7-t0)*1e3)
             threading.Thread(
                 target=self._playback_thread,
                 args=(schedule,),
@@ -559,7 +575,7 @@ def main():
     #                     help="Sampling temperature (default 1.0)")
     # args = parser.parse_args()
 
-    model_path = 'data/AMTmodel/music-small-800k'
+    model_path = '/data/AMTmodel/music-small-800k'
     client_ip = "192.168.1.2"
     listen_ip = "192.168.1.10"
     client_port = 9001
