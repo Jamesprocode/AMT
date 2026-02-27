@@ -16,9 +16,9 @@ resume_from_checkpoint: null            # set to a checkpoint path to resume, e.
 
 # ── Training hyperparameters ──────────────────────────────────────────────────
 epochs: 10
-batch_size: 4                   # per-device; reduce to 2 if OOM
-grad_accum: 8                   # effective batch = batch_size * grad_accum (default: 32)
-lr: 1.0e-5                      # much lower than original 3e-4 to avoid catastrophic forgetting
+batch_size: 32                  # per-device; H100 80GB can handle this easily
+grad_accum: 1                   # effective batch = batch_size * grad_accum (= 32)
+lr: 3.0e-5                      # scaled up with batch size (sqrt rule: 1e-5 * sqrt(8) ≈ 3e-5)
 
 # ── Checkpointing ─────────────────────────────────────────────────────────────
 save_steps: 1000                # save a checkpoint every N steps
