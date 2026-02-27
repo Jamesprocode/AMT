@@ -179,6 +179,104 @@ def filter_notes(notes: list[tuple], min_note_dist_ms: float = 50, max_notes_per
     return filtered
 
 
+def octave_fold(notes: list[tuple], lo: int = 48, hi: int = 95) -> list[tuple]:
+    """Transpose out-of-range notes by octaves until they fall within [lo, hi]."""
+    result = []
+    for (t, dur, pitch, instr) in notes:
+        p = pitch
+        while p < lo:
+            p += 12
+        while p > hi:
+            p -= 12
+        result.append((t, dur, p, instr))
+    return result
+
+
+def expand_tremolo(notes: list[tuple], max_dur_s: float = 1.0,
+                   tremolo_rate: float = 10.0, strike_dur_ms: float = 50.0) -> list[tuple]:
+    """Replace notes longer than max_dur_s with repeated rapid strikes (tremolo).
+
+    tremolo_rate  : strikes per second (10 → one strike every 100 ms)
+    strike_dur_ms : duration of each individual strike
+    The expanded notes are re-sorted so they interleave correctly with other notes.
+    """
+    interval   = 1.0 / tremolo_rate
+    strike_dur = strike_dur_ms / 1000.0
+    result     = []
+
+    for (t, dur, pitch, instr) in notes:
+        if dur <= max_dur_s:
+            result.append((t, dur, pitch, instr))
+        else:
+            n_strikes = int(dur * tremolo_rate)
+            for i in range(n_strikes):
+                result.append((t + i * interval, strike_dur, pitch, instr))
+
+    result.sort(key=lambda x: x[0])
+    return result
+
+
+def nudge_runs(notes: list[tuple], max_interval_ms: float = 150.0,
+               max_semitones: int = 3) -> list[tuple]:
+    """Snap fast close-pitched sequential notes to the previous pitch.
+
+    For consecutive notes that are both:
+      - sequential (not same-onset, gap > 10 ms)
+      - close in time  (gap < max_interval_ms)
+      - close in pitch (interval <= max_semitones)
+    the note's pitch is replaced with the previous pitch so the arm stays on
+    the same bar instead of travelling to an adjacent one.
+
+    Comparison is against the already-transformed previous note, so a whole
+    run collapses to repeated strikes on the run's starting pitch.
+    Notes with interval >= 4 semitones are left untouched (different arm).
+    """
+    if len(notes) < 2:
+        return notes
+
+    max_interval = max_interval_ms / 1000.0
+    result = [notes[0]]
+
+    for (t, dur, pitch, instr) in notes[1:]:
+        prev_t, _, prev_pitch, _ = result[-1]
+        d_time  = t - prev_t
+        d_pitch = abs(pitch - prev_pitch)
+
+        if d_time > 1e-2 and d_time < max_interval and 0 < d_pitch <= max_semitones:
+            result.append((t, dur, prev_pitch, instr))   # repeat previous pitch
+        else:
+            result.append((t, dur, pitch, instr))
+
+    return result
+
+
+def stagger_chords(notes: list[tuple], stagger_ms: float = 10.0) -> list[tuple]:
+    """Spread simultaneous notes (same onset) apart by stagger_ms each.
+
+    Notes within 10 ms of each other are treated as a chord. The first note
+    plays at its original time; each subsequent note in the chord is delayed
+    by an additional stagger_ms so arms do not all strike at the same instant.
+    """
+    if not notes:
+        return notes
+
+    stagger  = stagger_ms / 1000.0
+    result   = []
+    group_t  = notes[0][0]
+    count    = 0
+
+    for (t, dur, pitch, instrument) in notes:
+        if abs(t - group_t) < 1e-2:          # same onset group
+            result.append((t + count * stagger, dur, pitch, instrument))
+            count += 1
+        else:                                  # new onset group
+            group_t = t
+            count   = 1
+            result.append((t, dur, pitch, instrument))
+
+    return result
+
+
 def notes_to_schedule(notes: list[tuple], play_start: float, win_start: float = 0.0) -> list[tuple]:
     """Convert decoded (t, dur, pitch, instrument) notes → sorted OSC schedule.
 
@@ -218,6 +316,14 @@ class JamServer:
         human_instrument: int = 0,
         min_note_dist_ms: float = 50,
         max_notes_per_onset: int = 4,
+        stagger_ms: float = 11.0,
+        pitch_lo: int = 48,
+        pitch_hi: int = 95,
+        max_note_dur_s: float = 1.0,
+        tremolo_rate: float = 10.0,
+        tremolo_strike_dur_ms: float = 50.0,
+        run_interval_ms: float = 150.0,
+        run_semitones: int = 3,
     ):
         log.info("Loading model from %s …", model_path)
         device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
@@ -234,8 +340,16 @@ class JamServer:
         self.top_p               = top_p
         self.temperature         = temperature
         self.human_instrument    = human_instrument
-        self.min_note_dist_ms    = min_note_dist_ms
-        self.max_notes_per_onset = max_notes_per_onset
+        self.min_note_dist_ms      = min_note_dist_ms
+        self.max_notes_per_onset   = max_notes_per_onset
+        self.stagger_ms            = stagger_ms
+        self.pitch_lo              = pitch_lo
+        self.pitch_hi              = pitch_hi
+        self.max_note_dur_s        = max_note_dur_s
+        self.tremolo_rate          = tremolo_rate
+        self.tremolo_strike_dur_ms = tremolo_strike_dur_ms
+        self.run_interval_ms       = run_interval_ms
+        self.run_semitones         = run_semitones
 
         self._running = False
 
@@ -359,11 +473,16 @@ class JamServer:
             n_events = len(continuation) // 3
             log.info("Window %d: generated %d events in %.2fs", window_num, n_events, gen_elapsed)
 
-            # decode → filter → schedule
+            # decode → transform → schedule
             play_start = time.time()
             decoded  = decode_events(continuation)
+            decoded  = octave_fold(decoded, self.pitch_lo, self.pitch_hi)
+            decoded  = expand_tremolo(decoded, self.max_note_dur_s,
+                                      self.tremolo_rate, self.tremolo_strike_dur_ms)
+            decoded  = stagger_chords(decoded, self.stagger_ms)
+            decoded  = nudge_runs(decoded, self.run_interval_ms, self.run_semitones)
             decoded  = filter_notes(decoded, self.min_note_dist_ms, self.max_notes_per_onset)
-            log.info("Window %d: %d notes after filtering", window_num, len(decoded))
+            log.info("Window %d: %d notes after processing", window_num, len(decoded))
             schedule = notes_to_schedule(decoded, play_start, self.window_size)
             threading.Thread(
                 target=self._playback_thread,
@@ -440,7 +559,7 @@ def main():
     #                     help="Sampling temperature (default 1.0)")
     # args = parser.parse_args()
 
-    model_path = 'model/music-small-800k'
+    model_path = 'data/AMTmodel/music-small-800k'
     client_ip = "192.168.1.2"
     listen_ip = "192.168.1.10"
     client_port = 9001
