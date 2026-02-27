@@ -123,14 +123,9 @@ def notes_to_events(notes: list[tuple]) -> list[int]:
     return ops.sort(events)
 
 
-def events_to_schedule(events: list[int], play_start: float, win_start: float = 0.0) -> list[tuple]:
-    """Convert AMT event tokens → sorted list of (wall_time, address, args).
-
-    play_start : wall-clock time to begin playback
-    win_start  : session time (seconds) of the window start; subtracted so
-                 events with absolute session times play relative to play_start.
-    """
-    schedule = []
+def decode_events(events: list[int]) -> list[tuple]:
+    """Decode AMT event tokens → sorted list of (t, dur, pitch, instrument)."""
+    notes = []
     for i in range(0, len(events), 3):
         t_bins = events[i]     - TIME_OFFSET
         d_bins = events[i + 1] - DUR_OFFSET
@@ -141,20 +136,70 @@ def events_to_schedule(events: list[int], play_start: float, win_start: float = 
 
         instrument = note_v // MAX_PITCH
         pitch      = note_v  % MAX_PITCH
-        t_sec  = t_bins / TIME_RESOLUTION
-        d_sec  = max(0.05, d_bins / TIME_RESOLUTION)
+        t_sec      = t_bins / TIME_RESOLUTION
+        d_sec      = max(0.05, d_bins / TIME_RESOLUTION)
+        notes.append((t_sec, d_sec, pitch, instrument))
 
-        # Map instrument → MIDI channel 2-16 (channel 1 reserved for human)
-        channel = (instrument % 15) + 2
+    notes.sort(key=lambda x: x[0])
+    return notes
 
+
+def filter_notes(notes: list[tuple], min_note_dist_ms: float = 50, max_notes_per_onset: int = 4) -> list[tuple]:
+    """Filter generated notes: drop notes too close in time, cap polyphony per onset.
+
+    Mirrors Performer.filter_phrase() from demos.py but operates on
+    (t, dur, pitch, instrument) tuples instead of pretty_midi Note objects.
+
+    min_note_dist_ms   : minimum gap between consecutive note onsets (ms)
+    max_notes_per_onset: maximum simultaneous notes at the same onset (<10 ms apart)
+    """
+    if not notes:
+        return notes
+
+    min_note_dist = min_note_dist_ms / 1000.0
+    filtered = [notes[0]]
+    same_onset_count = 0
+
+    for i in range(1, len(notes)):
+        t_curr = notes[i][0]
+        t_prev = filtered[-1][0]
+        d_time = abs(t_curr - t_prev)
+
+        if d_time < 1e-2:                              # same onset (within 10 ms)
+            if same_onset_count >= max_notes_per_onset - 1:
+                continue
+            same_onset_count += 1
+        elif d_time < min_note_dist:                   # too close – skip
+            continue
+        else:
+            same_onset_count = 0
+
+        filtered.append(notes[i])
+
+    return filtered
+
+
+def notes_to_schedule(notes: list[tuple], play_start: float, win_start: float = 0.0) -> list[tuple]:
+    """Convert decoded (t, dur, pitch, instrument) notes → sorted OSC schedule.
+
+    play_start : wall-clock time to begin playback
+    win_start  : session time (seconds) of the window start
+    """
+    schedule = []
+    for (t_sec, d_sec, pitch, instrument) in notes:
+        channel  = (instrument % 15) + 2
         on_time  = play_start + (t_sec - win_start)
         off_time = on_time + d_sec
-
         schedule.append((on_time,  "/gen/noteon",  [pitch, 80, channel]))
         schedule.append((off_time, "/gen/noteoff", [pitch, channel]))
 
     schedule.sort(key=lambda x: x[0])
     return schedule
+
+
+def events_to_schedule(events: list[int], play_start: float, win_start: float = 0.0) -> list[tuple]:
+    """Convenience wrapper: decode_events → notes_to_schedule (no filtering)."""
+    return notes_to_schedule(decode_events(events), play_start, win_start)
 
 
 # ── Jam server ────────────────────────────────────────────────────────────────
@@ -171,6 +216,8 @@ class JamServer:
         top_p: float = 0.95,
         temperature: float = 1.0,
         human_instrument: int = 0,
+        min_note_dist_ms: float = 50,
+        max_notes_per_onset: int = 4,
     ):
         log.info("Loading model from %s …", model_path)
         device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
@@ -182,11 +229,13 @@ class JamServer:
         self.listen_ip   = listen_ip
         self.listen_port = listen_port
 
-        self.buffer          = NoteBuffer()
-        self.window_size     = window_size
-        self.top_p           = top_p
-        self.temperature     = temperature
-        self.human_instrument = human_instrument
+        self.buffer              = NoteBuffer()
+        self.window_size         = window_size
+        self.top_p               = top_p
+        self.temperature         = temperature
+        self.human_instrument    = human_instrument
+        self.min_note_dist_ms    = min_note_dist_ms
+        self.max_notes_per_onset = max_notes_per_onset
 
         self._running = False
 
@@ -310,9 +359,12 @@ class JamServer:
             n_events = len(continuation) // 3
             log.info("Window %d: generated %d events in %.2fs", window_num, n_events, gen_elapsed)
 
-            # play back starting NOW; subtract window_size offset from token times
+            # decode → filter → schedule
             play_start = time.time()
-            schedule   = events_to_schedule(continuation, play_start, self.window_size)
+            decoded  = decode_events(continuation)
+            decoded  = filter_notes(decoded, self.min_note_dist_ms, self.max_notes_per_onset)
+            log.info("Window %d: %d notes after filtering", window_num, len(decoded))
+            schedule = notes_to_schedule(decoded, play_start, self.window_size)
             threading.Thread(
                 target=self._playback_thread,
                 args=(schedule,),
