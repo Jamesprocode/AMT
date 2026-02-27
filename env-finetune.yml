@@ -1,0 +1,17 @@
+name: AMT-ft
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy<2
+  - matplotlib=3.7.1
+  - mido=1.2.10
+  - tqdm=4.65.0
+  - pytorch>=2.4.0
+  - safetensors>=0.4.0
+  - pip
+  - pip:
+      - transformers>=5.2.0
+      - accelerate>=0.34.0
+      - midi2audio==0.1.1
+      - python-osc
