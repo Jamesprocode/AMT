@@ -15,10 +15,10 @@ checkpoint_dir: /home/hice1/jwang3180/scratch/AMT/checkpoints/pijama-full      #
 resume_from_checkpoint: null            # set to a checkpoint path to resume, e.g. checkpoints/pijama/checkpoint-1000
 
 # ── Training hyperparameters ──────────────────────────────────────────────────
-epochs: 10
+epochs: 40
 batch_size: 4                 # per-device; H100 80GB can handle this easily
 grad_accum: 8                 # effective batch = batch_size * grad_accum (= 32)
-lr: 1.0e-5                      # scaled up with batch size (sqrt rule: 1e-5 * sqrt(8) ≈ 3e-5)
+lr: 5.0e-6                    # conservative for full finetune, avoid catastrophic forgetting
 
 # ── Checkpointing ─────────────────────────────────────────────────────────────
 save_steps: 1000                # save a checkpoint every N steps
@@ -31,5 +31,5 @@ sample_length: 10               # length of generated sample in seconds
 
 # ── W&B ───────────────────────────────────────────────────────────────────────
 wandb_project: amt-pijama
-wandb_run: amt-pijama-full-finetune         
+wandb_run: amt-pijama-full-40ep
 
