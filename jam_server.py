@@ -28,6 +28,7 @@ import threading
 import argparse
 from pathlib import Path
 
+import json
 import torch
 from transformers import AutoModelForCausalLM
 from pythonosc import dispatcher as osc_dispatcher
@@ -42,12 +43,37 @@ from anticipation.config import TIME_RESOLUTION, MAX_PITCH, MAX_DUR, MAX_TIME, D
 from anticipation.vocab import TIME_OFFSET, DUR_OFFSET, NOTE_OFFSET, ATIME_OFFSET, ADUR_OFFSET, ANOTE_OFFSET
 from anticipation.sample import generate
 
+from shimon_filter import filter_notes, octave_fold, expand_tremolo, nudge_runs, stagger_chords
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+# ── Model loader (handles full checkpoints and LoRA adapters) ─────────────────
+
+def _load_model(model_path: str, device: torch.device):
+    adapter_cfg_path = Path(model_path) / "adapter_config.json"
+    if adapter_cfg_path.exists():
+        from peft import PeftModel
+        with open(adapter_cfg_path) as f:
+            adapter_cfg = json.load(f)
+        base_path = adapter_cfg["base_model_name_or_path"]
+        if not Path(base_path).exists():
+            # fall back: look for the base model next to the adapter directory
+            base_path = str(Path(model_path).parent / "music-medium-800k")
+            log.warning("adapter base path not found; trying %s", base_path)
+        log.info("LoRA adapter – loading base model from %s …", base_path)
+        base = AutoModelForCausalLM.from_pretrained(base_path).to(device)
+        log.info("Applying LoRA weights from %s …", model_path)
+        model = PeftModel.from_pretrained(base, model_path)
+        model = model.merge_and_unload()
+        log.info("LoRA weights merged into base model")
+        return model
+    return AutoModelForCausalLM.from_pretrained(model_path).to(device)
 
 
 # ── Note buffer ──────────────────────────────────────────────────────────────
@@ -124,14 +150,9 @@ def notes_to_controls(notes: list[tuple]) -> list[int]:
     return ops.sort(controls)
 
 
-def events_to_schedule(events: list[int], play_start: float, win_start: float = 0.0) -> list[tuple]:
-    """Convert AMT event tokens → sorted list of (wall_time, address, args).
-
-    play_start : wall-clock time to begin playback
-    win_start  : session time (seconds) of the window start; subtracted so
-                 events with absolute session times play relative to play_start.
-    """
-    schedule = []
+def decode_events(events: list[int]) -> list[tuple]:
+    """Decode AMT event tokens → sorted list of (t, dur, pitch, instrument)."""
+    notes = []
     for i in range(0, len(events), 3):
         t_bins = events[i]     - TIME_OFFSET
         d_bins = events[i + 1] - DUR_OFFSET
@@ -142,28 +163,36 @@ def events_to_schedule(events: list[int], play_start: float, win_start: float = 
 
         instrument = note_v // MAX_PITCH
         pitch      = note_v  % MAX_PITCH
+        t_sec      = t_bins / TIME_RESOLUTION
+        d_sec      = max(0.05, d_bins / TIME_RESOLUTION)
+        notes.append((t_sec, d_sec, pitch, instrument))
 
-        # skip percussion (instrument 128)
-        # if instrument == 128:
-        #     continue
-
-        t_sec  = t_bins / TIME_RESOLUTION
-        d_sec  = max(0.05, d_bins / TIME_RESOLUTION)
-
-        # channel = 2  # all generated notes on channel 2
+    notes.sort(key=lambda x: x[0])
+    return notes
 
 
-        #saving a version to play full instrument channel
-        channel = (instrument % 15) + 2
 
+def notes_to_schedule(notes: list[tuple], play_start: float, win_start: float = 0.0) -> list[tuple]:
+    """Convert decoded (t, dur, pitch, instrument) notes → sorted OSC schedule.
+
+    play_start : wall-clock time to begin playback
+    win_start  : session time (seconds) of the window start
+    """
+    schedule = []
+    for (t_sec, d_sec, pitch, instrument) in notes:
+        channel  = (instrument % 15) + 2
         on_time  = play_start + (t_sec - win_start)
         off_time = on_time + d_sec
-
         schedule.append((on_time,  "/gen/noteon",  [pitch, 80, channel]))
         schedule.append((off_time, "/gen/noteoff", [pitch, channel]))
 
     schedule.sort(key=lambda x: x[0])
     return schedule
+
+
+def events_to_schedule(events: list[int], play_start: float, win_start: float = 0.0) -> list[tuple]:
+    """Convenience wrapper: decode_events → notes_to_schedule (no filtering)."""
+    return notes_to_schedule(decode_events(events), play_start, win_start)
 
 
 # ── Jam server ────────────────────────────────────────────────────────────────
@@ -180,10 +209,21 @@ class JamServer:
         top_p: float = 0.95,
         temperature: float = 1.0,
         human_instrument: int = 0,
+        min_note_dist_ms: float = 50,
+        max_notes_per_onset: int = 4,
+        stagger_ms: float = 11.0,
+        pitch_lo: int = 48,
+        pitch_hi: int = 95,
+        max_note_dur_s: float = 1.0,
+        tremolo_rate: float = 10.0,
+        tremolo_strike_dur_ms: float = 50.0,
+        run_interval_ms: float = 150.0,
+        run_semitones: int = 3,
+        shimonize: bool = True,
     ):
         log.info("Loading model from %s …", model_path)
         device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-        self.model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
+        self.model = _load_model(model_path, device)
         self.model.eval()
         log.info("Model ready on %s", next(self.model.parameters()).device)
 
@@ -191,11 +231,22 @@ class JamServer:
         self.listen_ip   = listen_ip
         self.listen_port = listen_port
 
-        self.buffer          = NoteBuffer()
-        self.window_size     = window_size
-        self.top_p           = top_p
-        self.temperature     = temperature
-        self.human_instrument = human_instrument
+        self.buffer              = NoteBuffer()
+        self.window_size         = window_size
+        self.top_p               = top_p
+        self.temperature         = temperature
+        self.human_instrument    = human_instrument
+        self.min_note_dist_ms      = min_note_dist_ms
+        self.max_notes_per_onset   = max_notes_per_onset
+        self.stagger_ms            = stagger_ms
+        self.pitch_lo              = pitch_lo
+        self.pitch_hi              = pitch_hi
+        self.max_note_dur_s        = max_note_dur_s
+        self.tremolo_rate          = tremolo_rate
+        self.tremolo_strike_dur_ms = tremolo_strike_dur_ms
+        self.run_interval_ms       = run_interval_ms
+        self.run_semitones         = run_semitones
+        self.shimonize             = shimonize
 
         self._running = False
 
@@ -315,9 +366,36 @@ class JamServer:
             n_events = len(events) // 3
             log.info("Window %d: generated %d events in %.2fs", window_num, n_events, gen_elapsed)
 
-            # play back starting NOW
+            # decode → (optional shimonization) → schedule
             play_start = time.time()
-            schedule   = events_to_schedule(events, play_start, 0.0)
+            t0 = time.time()
+
+            decoded = decode_events(events)
+            t1 = time.time(); log.info("  pipeline  decode_events  : %5.3f ms  (%d notes)", (t1-t0)*1e3, len(decoded))
+
+            if self.shimonize:
+                decoded = octave_fold(decoded, self.pitch_lo, self.pitch_hi)
+                t2 = time.time(); log.info("  pipeline  octave_fold    : %5.3f ms", (t2-t1)*1e3)
+
+                decoded = expand_tremolo(decoded, self.max_note_dur_s,
+                                         self.tremolo_rate, self.tremolo_strike_dur_ms)
+                t3 = time.time(); log.info("  pipeline  expand_tremolo : %5.3f ms  (%d notes)", (t3-t2)*1e3, len(decoded))
+
+                decoded = stagger_chords(decoded, self.stagger_ms)
+                t4 = time.time(); log.info("  pipeline  stagger_chords : %5.3f ms", (t4-t3)*1e3)
+
+                decoded = nudge_runs(decoded, self.run_interval_ms, self.run_semitones)
+                t5 = time.time(); log.info("  pipeline  nudge_runs     : %5.3f ms", (t5-t4)*1e3)
+
+                decoded = filter_notes(decoded, self.min_note_dist_ms, self.max_notes_per_onset)
+                t6 = time.time(); log.info("  pipeline  filter_notes   : %5.3f ms  (%d notes)", (t6-t5)*1e3, len(decoded))
+
+                log.info("  pipeline  TOTAL (shim)   : %5.3f ms", (t6-t0)*1e3)
+            else:
+                log.info("  pipeline  shimonize=False – skipping transforms")
+
+            schedule = notes_to_schedule(decoded, play_start, 0.0)
+            t7 = time.time(); log.info("  pipeline  notes_to_sched : %5.3f ms", (t7-t1)*1e3)
             threading.Thread(
                 target=self._playback_thread,
                 args=(schedule,),
@@ -393,7 +471,7 @@ def main():
     #                     help="Sampling temperature (default 1.0)")
     # args = parser.parse_args()
 
-    model_path = 'model/music-small-800k'
+    model_path = '/data/AMTmodel/music-medium-800k'
     client_ip = "192.168.1.2"
     listen_ip = "192.168.1.10"
     client_port = 9001
@@ -408,6 +486,7 @@ def main():
         window_size   = 6.0,
         top_p         = 0.95,
         temperature   = 1.0,
+        shimonize= True
     )
     server.run()
 
