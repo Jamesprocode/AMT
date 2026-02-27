@@ -19,6 +19,7 @@ if not hasattr(huggingface_hub, 'is_offline_mode'):
 import math
 import torch
 import wandb
+from tqdm import tqdm
 from torch.utils.data import Dataset
 from transformers import AutoModelForCausalLM, TrainingArguments, Trainer, TrainerCallback
 
@@ -62,7 +63,7 @@ class PijamaCallback(TrainerCallback):
         if metrics and 'eval_loss' in metrics:
             wandb.log({
                 'eval/perplexity': math.exp(metrics['eval_loss']),
-            }, step=state.global_step)
+            })
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs and 'loss' in logs:
@@ -107,6 +108,23 @@ class PijamaCallback(TrainerCallback):
             print(f'[PijamaCallback] sample generation failed: {e}')
         finally:
             self.model.train()
+
+
+class EpochProgressCallback(TrainerCallback):
+    """Replaces the default full-run progress bar with a per-epoch bar."""
+
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        steps_per_epoch = state.max_steps // int(args.num_train_epochs)
+        epoch = int(state.epoch) + 1
+        self.pbar = tqdm(total=steps_per_epoch, desc=f'Epoch {epoch}/{int(args.num_train_epochs)}', leave=True)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if hasattr(self, 'pbar'):
+            self.pbar.update(1)
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        if hasattr(self, 'pbar'):
+            self.pbar.close()
 
 
 def main(cfg):
@@ -179,6 +197,7 @@ def main(cfg):
         fp16=(not bf16_supported and torch.cuda.is_available()),
         dataloader_num_workers=2,
         report_to='wandb',
+        disable_tqdm=True,
     )
 
     trainer = Trainer(
@@ -186,11 +205,14 @@ def main(cfg):
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
-        callbacks=[PijamaCallback(
-            model,
-            sample_every_steps=cfg.get('sample_every_steps', 500),
-            sample_length=cfg.get('sample_length', 10),
-        )],
+        callbacks=[
+            PijamaCallback(
+                model,
+                sample_every_steps=cfg.get('sample_every_steps', 500),
+                sample_length=cfg.get('sample_length', 10),
+            ),
+            EpochProgressCallback(),
+        ],
     )
 
     # --- Train ---

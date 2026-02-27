@@ -9,16 +9,16 @@ seed: 42
 workers: 8                      # parallel CPU workers for preprocessing (default: all cores)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-model: model/music-medium-800k   # HF model ID or local checkpoint path
-lora: true                               # true = LoRA (~8GB VRAM), false = full finetune (~24GB)
-checkpoint_dir: checkpoints/pijama      # where to save checkpoints
+model: /home/hice1/jwang3180/scratch/AMT/model/music-medium-800k   # HF model ID or local checkpoint path
+lora: false                               # true = LoRA (~8GB VRAM), false = full finetune (~24GB)
+checkpoint_dir: /home/hice1/jwang3180/scratch/AMT/checkpoints/pijama-full      # where to save checkpoints
 resume_from_checkpoint: null            # set to a checkpoint path to resume, e.g. checkpoints/pijama/checkpoint-1000
 
 # ── Training hyperparameters ──────────────────────────────────────────────────
 epochs: 10
-batch_size: 32                  # per-device; H100 80GB can handle this easily
-grad_accum: 1                   # effective batch = batch_size * grad_accum (= 32)
-lr: 3.0e-5                      # scaled up with batch size (sqrt rule: 1e-5 * sqrt(8) ≈ 3e-5)
+batch_size: 4                 # per-device; H100 80GB can handle this easily
+grad_accum: 8                 # effective batch = batch_size * grad_accum (= 32)
+lr: 1.0e-5                      # scaled up with batch size (sqrt rule: 1e-5 * sqrt(8) ≈ 3e-5)
 
 # ── Checkpointing ─────────────────────────────────────────────────────────────
 save_steps: 1000                # save a checkpoint every N steps
@@ -31,4 +31,5 @@ sample_length: 10               # length of generated sample in seconds
 
 # ── W&B ───────────────────────────────────────────────────────────────────────
 wandb_project: amt-pijama
-wandb_run: amt-pijama-first try                 # null = auto-generated name
+wandb_run: amt-pijama-full-finetune         
+
