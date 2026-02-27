@@ -18,6 +18,7 @@ import random
 import yaml
 from glob import glob
 from collections import defaultdict
+from multiprocessing import Pool, cpu_count
 
 import numpy as np
 from tqdm import tqdm
@@ -37,12 +38,14 @@ from anticipation.convert import midi_to_compound, compound_to_events
 from anticipation.tokenize import maybe_tokenize, extract_spans, extract_random, ANTICIPATION_RATES
 
 
-def process_midi(midi_path):
-    """Convert a MIDI file to compound tokens. Returns None on failure."""
+def process_midi(args):
+    """Convert a MIDI file to sequences. Returns list of sequences (empty on failure)."""
+    midi_path, augment_factor = args
     try:
-        return midi_to_compound(midi_path)
+        compound = midi_to_compound(midi_path)
     except Exception:
-        return None
+        return []
+    return make_sequences(compound, augment_factor=augment_factor)
 
 
 def make_sequences(compound_tokens, augment_factor=1):
@@ -156,19 +159,18 @@ def main(cfg):
         ('valid', valid_files, 1),
     ]
 
+    workers = cfg.get('workers', cpu_count())
+    print(f'Using {workers} workers')
+
     for split_name, files, augment in splits:
         out_path = os.path.join(cfg['output_dir'], f'{split_name}.txt')
         sequences = []
-        skipped = 0
 
         print(f'\nProcessing {split_name} split (augment x{augment}) ...')
-        for midi_path in tqdm(files):
-            compound = process_midi(midi_path)
-            if compound is None:
-                skipped += 1
-                continue
-            seqs = make_sequences(compound, augment_factor=augment)
-            sequences.extend(seqs)
+        args = [(f, augment) for f in files]
+        with Pool(processes=workers) as pool:
+            for seqs in tqdm(pool.imap(process_midi, args), total=len(files)):
+                sequences.extend(seqs)
 
         if split_name == 'train':
             random.shuffle(sequences)
@@ -177,9 +179,8 @@ def main(cfg):
             for seq in sequences:
                 f.write(' '.join(map(str, seq)) + '\n')
 
+        skipped = len(files) - sum(1 for _ in sequences)
         print(f'  => {len(sequences)} sequences written to {out_path}')
-        if skipped:
-            print(f'  => {skipped} files skipped (parse errors)')
 
     print('\nDone. Run finetune_pijama.py next.')
 

@@ -6,6 +6,7 @@ output_dir: data/pijama         # where train.txt / valid.txt are written
 augment_factor: 1               # 1 = autoregressive only
                                 # 10 = full anticipation augmentation (spans + random)
 seed: 42
+workers: 8                      # parallel CPU workers for preprocessing (default: all cores)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 model: model/music-medium-800k   # HF model ID or local checkpoint path
