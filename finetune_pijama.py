@@ -16,13 +16,16 @@ import huggingface_hub
 if not hasattr(huggingface_hub, 'is_offline_mode'):
     huggingface_hub.is_offline_mode = lambda: True
 
+import math
 import torch
 import wandb
 from torch.utils.data import Dataset
-from transformers import AutoModelForCausalLM, TrainingArguments, Trainer
+from transformers import AutoModelForCausalLM, TrainingArguments, Trainer, TrainerCallback
 
 from anticipation.config import CONTEXT_SIZE
-from anticipation.vocab import VOCAB_SIZE
+from anticipation.vocab import VOCAB_SIZE, AUTOREGRESS
+from anticipation.sample import generate
+from anticipation.convert import events_to_midi
 
 
 class MidiTokenDataset(Dataset):
@@ -45,6 +48,65 @@ class MidiTokenDataset(Dataset):
         tokens = torch.tensor(self.sequences[idx], dtype=torch.long)
         # labels=input_ids: HuggingFace CausalLM shifts internally for the loss
         return {'input_ids': tokens, 'labels': tokens.clone()}
+
+
+class PijamaCallback(TrainerCallback):
+    """Logs perplexity, GPU stats, LoRA weight norms, and audio samples to W&B."""
+
+    def __init__(self, model, sample_every_steps=500, sample_length=10):
+        self.model = model
+        self.sample_every_steps = sample_every_steps
+        self.sample_length = sample_length
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics and 'eval_loss' in metrics:
+            wandb.log({
+                'eval/perplexity': math.exp(metrics['eval_loss']),
+            }, step=state.global_step)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs and 'loss' in logs:
+            wandb.log({
+                'train/perplexity': math.exp(logs['loss']),
+            }, step=state.global_step)
+
+        # GPU memory
+        if torch.cuda.is_available():
+            wandb.log({
+                'system/gpu_memory_allocated_gb': torch.cuda.memory_allocated() / 1e9,
+                'system/gpu_memory_reserved_gb':  torch.cuda.memory_reserved() / 1e9,
+            }, step=state.global_step)
+
+        # LoRA weight norms — how much the adapters have moved from init
+        lora_norms = {}
+        for name, param in self.model.named_parameters():
+            if 'lora_' in name and param.requires_grad:
+                lora_norms[f'lora_norms/{name}'] = param.norm().item()
+        if lora_norms:
+            wandb.log(lora_norms, step=state.global_step)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.sample_every_steps != 0:
+            return
+
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                events = generate(
+                    self.model,
+                    start_time=0,
+                    end_time=self.sample_length,
+                    top_p=0.98,
+                )
+            mid = events_to_midi(events)
+            path = f'sample_step{state.global_step}.mid'
+            mid.save(path)
+            wandb.log({'samples/midi': wandb.Audio(path, caption=f'step {state.global_step}')},
+                      step=state.global_step)
+        except Exception as e:
+            print(f'[PijamaCallback] sample generation failed: {e}')
+        finally:
+            self.model.train()
 
 
 def main(cfg):
@@ -106,10 +168,10 @@ def main(cfg):
         warmup_steps=200,
         lr_scheduler_type='cosine',
         eval_strategy='steps',
-        eval_steps=500,
+        eval_steps=cfg.get('eval_steps', 200),
         save_strategy='steps',
-        save_steps=500,
-        save_total_limit=3,
+        save_steps=cfg.get('save_steps', 1000),
+        save_total_limit=cfg.get('save_total_limit', 2),
         load_best_model_at_end=True,
         metric_for_best_model='eval_loss',
         logging_steps=50,
@@ -124,6 +186,11 @@ def main(cfg):
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
+        callbacks=[PijamaCallback(
+            model,
+            sample_every_steps=cfg.get('sample_every_steps', 500),
+            sample_length=cfg.get('sample_length', 10),
+        )],
     )
 
     # --- Train ---

@@ -20,6 +20,15 @@ batch_size: 4                   # per-device; reduce to 2 if OOM
 grad_accum: 8                   # effective batch = batch_size * grad_accum (default: 32)
 lr: 1.0e-5                      # much lower than original 3e-4 to avoid catastrophic forgetting
 
+# ── Checkpointing ─────────────────────────────────────────────────────────────
+save_steps: 1000                # save a checkpoint every N steps
+save_total_limit: 5             # keep only the N most recent checkpoints (+ best)
+eval_steps: 200                 # evaluate every N steps (finer-grained loss curve)
+
+# ── Sampling / logging ────────────────────────────────────────────────────────
+sample_every_steps: 500         # generate a MIDI audio sample every N steps and log to W&B
+sample_length: 10               # length of generated sample in seconds
+
 # ── W&B ───────────────────────────────────────────────────────────────────────
 wandb_project: amt-pijama
 wandb_run: amt-pijama-first try                 # null = auto-generated name
