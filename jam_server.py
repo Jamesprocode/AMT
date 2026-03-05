@@ -431,20 +431,19 @@ class JamServer:
         server = osc_server.ThreadingOSCUDPServer(
             (self.listen_ip, self.listen_port), disp
         )
-        log.info("OSC server listening on %s:%d", self.listen_ip, self.listen_port)
         log.info("Sending generated notes to %s:%d",
                  self.client._address, self.client._port)
-        threading.Thread(target=self._startup_test, daemon=True).start()
+        self._startup_test()
+        log.info("OSC server listening on %s:%d", self.listen_ip, self.listen_port)
         server.serve_forever()
 
     def _startup_test(self):
-        time.sleep(2.0)
         log.info("STARTUP TEST: firing C major arpeggio to %s:%d",
                  self.client._address, self.client._port)
         for pitch in [50, 62, 74, 86]:
             self.client.send_message("/gen/noteon",  [pitch, 100, 2])
             log.info("  → /gen/noteon [pitch=%d vel=100 ch=2]", pitch)
-            time.sleep(0.3)
+            time.sleep(1.0)
             self.client.send_message("/gen/noteoff", [pitch, 2])
         log.info("STARTUP TEST done – if Max heard 4 notes the return path is working")
 
