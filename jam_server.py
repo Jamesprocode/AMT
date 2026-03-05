@@ -471,7 +471,7 @@ def main():
     #                     help="Sampling temperature (default 1.0)")
     # args = parser.parse_args()
 
-    model_path = '/data/AMTmodel/music-medium-800k'
+    model_path = '/data/AMTmodel/full-18000'
     client_ip = "192.168.1.2"
     listen_ip = "192.168.1.10"
     client_port = 9001
