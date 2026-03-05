@@ -441,7 +441,7 @@ class JamServer:
         time.sleep(2.0)
         log.info("STARTUP TEST: firing C major arpeggio to %s:%d",
                  self.client._address, self.client._port)
-        for pitch in [60, 64, 67, 72]:
+        for pitch in [50, 62, 74, 86]:
             self.client.send_message("/gen/noteon",  [pitch, 100, 2])
             log.info("  → /gen/noteon [pitch=%d vel=100 ch=2]", pitch)
             time.sleep(0.3)
@@ -471,7 +471,7 @@ def main():
     #                     help="Sampling temperature (default 1.0)")
     # args = parser.parse_args()
 
-    model_path = '/data/AMTmodel/music-medium-800k'
+    model_path = '/data/AMTmodel/full-18000'
     client_ip = "192.168.1.2"
     listen_ip = "192.168.1.10"
     client_port = 9001
