@@ -512,7 +512,7 @@ def main():
     #                     help="Sampling temperature (default 1.0)")
     # args = parser.parse_args()
 
-    model_path = '/data/AMTmodel/full-18000'
+    model_path = '/data/AMTmodel/pop909_10epfinal'
     client_ip = "192.168.1.2"
     listen_ip = "192.168.1.10"
     client_port = 9001
@@ -524,12 +524,12 @@ def main():
         listen_port         = listen_port,
         client_ip           = client_ip,
         client_port         = client_port,
-        window_size         = 6.0,
+        window_size         = 15.0,
         generation_length   = 15.0,
         key_change_threshold= 0.35,
-        top_p               = 0.95,
-        temperature         = 1.0,
-        shimonize           = True,
+        top_p               = 0.90,
+        temperature         = 0.8,
+        shimonize           = False,
     )
     server.run()
 
