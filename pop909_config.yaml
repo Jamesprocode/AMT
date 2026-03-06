@@ -1,9 +1,9 @@
 # ── Data paths ────────────────────────────────────────────────────────────────
 data_dir: POP909-Dataset/POP909      # folder containing NNN/NNN.mid files
-output_dir: data/pop909-aug5         # where train.txt / valid.txt are written
+output_dir: data/pop909        # where train.txt / valid.txt are written
 
 # ── Preprocessing ─────────────────────────────────────────────────────────────
-augment_factor: 5               # anticipation augmentation (5 = good balance of speed vs diversity)
+augment_factor: 1               # anticipation augmentation (5 = good balance of speed vs diversity)
 valid_ratio: 0.1                # 10% of songs held out for validation (~90 songs)
 seed: 42
 workers: 8
@@ -31,4 +31,4 @@ sample_length: 10
 
 # ── W&B ───────────────────────────────────────────────────────────────────────
 wandb_project: amt-pijama
-wandb_run: amt-pop909-full-10ep-aug5
+wandb_run: amt-pop909-full-10ep
