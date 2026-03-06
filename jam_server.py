@@ -359,9 +359,11 @@ class JamServer:
 
         Returns (phrase_start, phrase_end) as session-relative times.
         """
-        # wait for the very first note before starting the phrase clock
+        # wait for the first note that arrives after we start listening
+        wait_start = self.buffer.elapsed()
         while self._running:
-            if self.buffer.last_event_time() is not None:
+            last_t = self.buffer.last_event_time()
+            if last_t is not None and last_t > wait_start:
                 break
             time.sleep(0.05)
 
