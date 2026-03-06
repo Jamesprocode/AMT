@@ -516,7 +516,16 @@ class JamServer:
         log.info("Sending generated notes to %s:%d",
                  self.client._address, self.client._port)
         threading.Thread(target=self._startup_test, daemon=True).start()
-        server.serve_forever()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            log.info("Shutting down – sending all notes off …")
+            self._running = False
+            for ch in range(2, 17):
+                for pitch in range(128):
+                    self.client.send_message("/gen/noteoff", [pitch, ch])
+            self.client.send_message("/gen/status", ["stopped"])
+            log.info("Done")
 
     def _startup_test(self):
         time.sleep(2.0)
