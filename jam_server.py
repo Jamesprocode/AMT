@@ -86,18 +86,21 @@ class NoteBuffer:
         self._pending: dict[int, tuple[float, int]] = {}   # pitch → (on_time, velocity)
         self._done: list[tuple[float, float, int, int]] = []  # (t, dur, pitch, instrument)
         self._t0: float | None = None
+        self._last_event_time: float | None = None          # session-relative time of last note activity
 
     def start(self):
         with self._lock:
             self._pending.clear()
             self._done.clear()
             self._t0 = time.time()
+            self._last_event_time = None
 
     def note_event(self, pitch: int, velocity: int, instrument: int = 0):
         with self._lock:
             if self._t0 is None:
                 return
             now = time.time() - self._t0
+            self._last_event_time = now
             if velocity > 0:
                 self._pending[pitch] = (now, velocity)
             else:
@@ -105,6 +108,11 @@ class NoteBuffer:
                     on_t, _ = self._pending.pop(pitch)
                     dur = max(0.05, now - on_t)
                     self._done.append((on_t, dur, pitch, instrument))
+
+    def last_event_time(self) -> float | None:
+        """Session-relative time of the most recent note-on or note-off."""
+        with self._lock:
+            return self._last_event_time
 
     def collect_window(self, t_start: float, t_end: float) -> list[tuple]:
         """Return completed notes whose note-on fell in [t_start, t_end], window-relative times."""
@@ -205,8 +213,17 @@ class JamServer:
         client_ip: str,
         client_port: int,
         window_size: float = 6.0,
+        phrase_end_silence: float = 1.5,
+        max_phrase_duration: float = 8.0,
         top_p: float = 0.95,
         temperature: float = 1.0,
+        density_adaptive: bool = True,
+        density_lo: float = 1.0,    # notes/sec considered sparse
+        density_hi: float = 6.0,    # notes/sec considered dense
+        temp_lo: float = 0.7,       # temperature at low density
+        temp_hi: float = 1.2,       # temperature at high density
+        top_p_lo: float = 0.85,     # top_p at low density
+        top_p_hi: float = 0.98,     # top_p at high density
         human_instrument: int = 0,
         min_note_dist_ms: float = 50,
         max_notes_per_onset: int = 4,
@@ -230,10 +247,19 @@ class JamServer:
         self.listen_ip   = listen_ip
         self.listen_port = listen_port
 
-        self.buffer              = NoteBuffer()
-        self.window_size         = window_size
-        self.top_p               = top_p
-        self.temperature         = temperature
+        self.buffer                = NoteBuffer()
+        self.window_size           = window_size
+        self.phrase_end_silence    = phrase_end_silence
+        self.max_phrase_duration   = max_phrase_duration
+        self.top_p                 = top_p
+        self.temperature           = temperature
+        self.density_adaptive      = density_adaptive
+        self.density_lo            = density_lo
+        self.density_hi            = density_hi
+        self.temp_lo               = temp_lo
+        self.temp_hi               = temp_hi
+        self.top_p_lo              = top_p_lo
+        self.top_p_hi              = top_p_hi
         self.human_instrument    = human_instrument
         self.min_note_dist_ms      = min_note_dist_ms
         self.max_notes_per_onset   = max_notes_per_onset
@@ -306,26 +332,75 @@ class JamServer:
         self.temperature = float(value)
         log.info("temperature → %.3f", self.temperature)
 
+    # ── Density-adaptive sampling ─────────────────────────────────────────────
+
+    def _sampling_params(self, notes: list[tuple], phrase_dur: float) -> tuple[float, float]:
+        """Return (temperature, top_p) scaled by note density of the phrase.
+
+        Dense playing (fast runs) → higher temperature + top_p for energetic response.
+        Sparse playing (slow ballad) → lower values for focused, conservative generation.
+        Falls back to manual top_p/temperature if density_adaptive=False.
+        """
+        if not self.density_adaptive or phrase_dur <= 0:
+            return self.temperature, self.top_p
+
+        density = len(notes) / phrase_dur   # notes per second
+        # linearly interpolate between lo and hi bounds
+        t = max(0.0, min(1.0, (density - self.density_lo) / max(self.density_hi - self.density_lo, 1e-6)))
+        temperature = self.temp_lo  + t * (self.temp_hi  - self.temp_lo)
+        top_p       = self.top_p_lo + t * (self.top_p_hi - self.top_p_lo)
+        log.info("Density %.2f notes/s → temperature=%.2f  top_p=%.2f", density, temperature, top_p)
+        return temperature, top_p
+
     # ── Generation loop ───────────────────────────────────────────────────────
+
+    def _wait_for_phrase_end(self) -> tuple[float, float]:
+        """Block until the user pauses for phrase_end_silence seconds or max_phrase_duration is hit.
+
+        Returns (phrase_start, phrase_end) as session-relative times.
+        """
+        # wait for the very first note before starting the phrase clock
+        while self._running:
+            if self.buffer.last_event_time() is not None:
+                break
+            time.sleep(0.05)
+
+        phrase_start = self.buffer.last_event_time()
+        log.info("Phrase started at %.2fs", phrase_start)
+
+        while self._running:
+            time.sleep(0.05)
+            last_t   = self.buffer.last_event_time()
+            elapsed  = self.buffer.elapsed()
+            silence  = elapsed - last_t
+            duration = last_t - phrase_start
+
+            if silence >= self.phrase_end_silence:
+                log.info("Phrase ended — silence %.2fs >= %.2fs", silence, self.phrase_end_silence)
+                return phrase_start, last_t
+
+            if duration >= self.max_phrase_duration:
+                log.info("Phrase capped — duration %.2fs >= %.2fs", duration, self.max_phrase_duration)
+                return phrase_start, last_t
+
+        return phrase_start, self.buffer.elapsed()
 
     def _generation_loop(self):
         window_num = 0
 
         while self._running:
-            # wait for one full window of human input
-            time.sleep(self.window_size)
+            # wait for a complete phrase (first note → silence gap)
+            phrase_start, phrase_end = self._wait_for_phrase_end()
             if not self._running:
                 break
 
-            elapsed   = self.buffer.elapsed()
-            win_end   = elapsed
-            win_start = win_end - self.window_size
-
-            log.info("Window %d: collecting [%.1f, %.1f]s", window_num, win_start, win_end)
-            notes = self.buffer.collect_window(win_start, win_end)
+            phrase_dur = phrase_end - phrase_start
+            log.info("Window %d: collecting phrase [%.1f, %.1f]s (%.1fs)",
+                     window_num, phrase_start, phrase_end, phrase_dur)
+            notes = self.buffer.collect_window(phrase_start, phrase_end)
 
             if not notes:
-                log.info("Window %d: no human notes – skipping generation", window_num)
+                log.info("Window %d: no notes in phrase – skipping", window_num)
                 window_num += 1
                 continue
 
@@ -341,19 +416,20 @@ class JamServer:
                     name = note_names[pitch % 12] + str(pitch // 12 - 1)
                     log.info("  t=%5.2fs  dur=%.2fs  %s (pitch=%d  instr=%d)",
                              t, dur, name, pitch, instr)
-                log.info("  %d notes → continuation [%.1f, %.1f]s",
-                         len(notes), self.window_size, self.window_size * 2)
+                log.info("  %d notes → continuation [0, %.1f]s", len(notes), phrase_dur)
                 log.info("─────────────────────────────────────────────────")
 
+                temperature, top_p = self._sampling_params(notes, phrase_dur)
+                self.client.send_message("/gen/params", [temperature, top_p])
                 with torch.no_grad():
                     events = generate(
                         self.model,
-                        start_time  = self.window_size,
-                        end_time    = self.window_size * 2,
+                        start_time  = phrase_dur,
+                        end_time    = phrase_dur * 2,
                         inputs      = prompt,
                         controls    = [],
-                        top_p       = self.top_p,
-                        temperature = self.temperature,
+                        top_p       = top_p,
+                        temperature = temperature,
                     )
             except Exception as exc:
                 log.exception("Generation failed: %s", exc)
@@ -362,7 +438,7 @@ class JamServer:
                 continue
 
             # clip to just the new continuation window
-            continuation = ops.clip(events, self.window_size, self.window_size * 2,
+            continuation = ops.clip(events, phrase_dur, phrase_dur * 2,
                                     clip_duration=False, seconds=True)
 
             gen_elapsed = time.time() - t_gen_start
@@ -397,7 +473,7 @@ class JamServer:
             else:
                 log.info("  pipeline  shimonize=False – skipping transforms")
 
-            schedule = notes_to_schedule(decoded, play_start, self.window_size)
+            schedule = notes_to_schedule(decoded, play_start, phrase_dur)
             t7 = time.time(); log.info("  pipeline  notes_to_sched : %5.3f ms", (t7-t1)*1e3)
             threading.Thread(
                 target=self._playback_thread,
