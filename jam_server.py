@@ -220,8 +220,8 @@ class JamServer:
         density_adaptive: bool = True,
         density_lo: float = 1.0,    # notes/sec considered sparse
         density_hi: float = 6.0,    # notes/sec considered dense
-        temp_lo: float = 0.7,       # temperature at low density
-        temp_hi: float = 1.2,       # temperature at high density
+        temp_lo: float = 0.5,       # temperature at low density
+        temp_hi: float = 2.0,       # temperature at high density
         top_p_lo: float = 0.85,     # top_p at low density
         top_p_hi: float = 0.98,     # top_p at high density
         human_instrument: int = 0,
