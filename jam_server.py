@@ -206,6 +206,8 @@ class JamServer:
         client_ip: str,
         client_port: int,
         window_size: float = 6.0,
+        generation_length: float = 15.0,
+        key_change_threshold: float = 0.35,
         top_p: float = 0.95,
         temperature: float = 1.0,
         human_instrument: int = 0,
@@ -231,11 +233,13 @@ class JamServer:
         self.listen_ip   = listen_ip
         self.listen_port = listen_port
 
-        self.buffer              = NoteBuffer()
-        self.window_size         = window_size
-        self.top_p               = top_p
-        self.temperature         = temperature
-        self.human_instrument    = human_instrument
+        self.buffer                = NoteBuffer()
+        self.window_size           = window_size
+        self.generation_length     = generation_length
+        self.key_change_threshold  = key_change_threshold
+        self.top_p                 = top_p
+        self.temperature           = temperature
+        self.human_instrument      = human_instrument
         self.min_note_dist_ms      = min_note_dist_ms
         self.max_notes_per_onset   = max_notes_per_onset
         self.stagger_ms            = stagger_ms
@@ -248,7 +252,9 @@ class JamServer:
         self.run_semitones         = run_semitones
         self.shimonize             = shimonize
 
-        self._running = False
+        self._running                  = False
+        self._prev_pitch_classes: set  = set()
+        self._current_playback_cancel: threading.Event | None = None
 
     # ── OSC handlers ──────────────────────────────────────────────────────────
 
@@ -307,6 +313,27 @@ class JamServer:
         self.temperature = float(value)
         log.info("temperature → %.3f", self.temperature)
 
+    # ── Key change detection ──────────────────────────────────────────────────
+
+    def _detect_key_change(self, notes: list[tuple]) -> bool:
+        """Return True if the pitch class content has shifted dramatically.
+
+        Uses Jaccard similarity between current and previous window pitch classes.
+        A similarity below key_change_threshold signals a key/tonality change.
+        """
+        current = set(pitch % 12 for (_, _, pitch, _) in notes)
+        if not self._prev_pitch_classes or not current:
+            self._prev_pitch_classes = current
+            return False
+        union        = self._prev_pitch_classes | current
+        intersection = self._prev_pitch_classes & current
+        similarity   = len(intersection) / len(union)
+        changed      = similarity < self.key_change_threshold
+        if changed:
+            log.info("Key change detected — Jaccard=%.2f (threshold=%.2f)", similarity, self.key_change_threshold)
+        self._prev_pitch_classes = current
+        return changed
+
     # ── Generation loop ───────────────────────────────────────────────────────
 
     def _generation_loop(self):
@@ -330,7 +357,10 @@ class JamServer:
                 window_num += 1
                 continue
 
-            log.info("Window %d: %d notes – generating …", window_num, len(notes))
+            key_changed = self._detect_key_change(notes)
+
+            log.info("Window %d: %d notes – generating %.1fs of accompaniment …",
+                     window_num, len(notes), self.generation_length)
             t_gen_start = time.time()
 
             try:
@@ -343,14 +373,14 @@ class JamServer:
                     log.info("  t=%5.2fs  dur=%.2fs  %s (pitch=%d  instr=%d)",
                              t, dur, name, pitch, instr)
                 log.info("  %d notes → accompaniment [0, %.1f]s",
-                         len(notes), self.window_size)
+                         len(notes), self.generation_length)
                 log.info("─────────────────────────────────────────────────")
 
                 with torch.no_grad():
                     events = generate(
                         self.model,
                         start_time  = 0,
-                        end_time    = self.window_size,
+                        end_time    = self.generation_length,
                         inputs      = [],
                         controls    = controls,
                         top_p       = self.top_p,
@@ -396,21 +426,33 @@ class JamServer:
 
             schedule = notes_to_schedule(decoded, play_start, 0.0)
             t7 = time.time(); log.info("  pipeline  notes_to_sched : %5.3f ms", (t7-t1)*1e3)
+            # cancel old playback now that new one is ready — no silence gap
+            if key_changed and self._current_playback_cancel is not None:
+                log.info("Window %d: key change — cancelling old playback now", window_num)
+                self._current_playback_cancel.set()
+            cancel_event = threading.Event()
+            self._current_playback_cancel = cancel_event
             threading.Thread(
                 target=self._playback_thread,
-                args=(schedule,),
+                args=(schedule, cancel_event),
                 daemon=True,
             ).start()
 
             window_num += 1
 
-    def _playback_thread(self, schedule: list[tuple]):
+    def _playback_thread(self, schedule: list[tuple], cancel: threading.Event):
         log.info("Playback: sending %d OSC messages to %s:%d",
                  len(schedule), self.client._address, self.client._port)
         for (target_time, address, args) in schedule:
+            if cancel.is_set():
+                log.info("Playback: cancelled (key change)")
+                return
             now = time.time()
             if target_time > now:
-                time.sleep(target_time - now)
+                # sleep in small steps so cancel is checked promptly
+                if cancel.wait(timeout=target_time - now):
+                    log.info("Playback: cancelled (key change)")
+                    return
             log.info("  → %s %s", address, args)
             self.client.send_message(address, args)
         log.info("Playback: done")
@@ -477,15 +519,17 @@ def main():
     listen_port = 9000
 
     server = JamServer(
-        model_path    = model_path,
-        listen_ip     = listen_ip,
-        listen_port   = listen_port,
-        client_ip     = client_ip,
-        client_port   = client_port,
-        window_size   = 6.0,
-        top_p         = 0.95,
-        temperature   = 1.0,
-        shimonize= True
+        model_path          = model_path,
+        listen_ip           = listen_ip,
+        listen_port         = listen_port,
+        client_ip           = client_ip,
+        client_port         = client_port,
+        window_size         = 6.0,
+        generation_length   = 15.0,
+        key_change_threshold= 0.35,
+        top_p               = 0.95,
+        temperature         = 1.0,
+        shimonize           = True,
     )
     server.run()
 

@@ -8,3 +8,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+data/
+midi_melody_extraction/
+wandb/
+POP909-Dataset/
