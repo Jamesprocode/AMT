@@ -10,8 +10,8 @@ __pycache__/
 *.pyd
 
 checkpoints/
-data/
 wandb/
+data/
 
 Anticipatory_Music_Transformer local.ipynb
 Anticipatory_Music_Transformer remote.ipynb
