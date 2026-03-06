@@ -15,3 +15,6 @@ wandb/
 
 Anticipatory_Music_Transformer local.ipynb
 Anticipatory_Music_Transformer remote.ipynb
+
+midi_melody_extraction/
+POP909-Dataset/

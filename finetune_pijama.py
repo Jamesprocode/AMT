@@ -206,6 +206,10 @@ def main(cfg):
 
 
 if __name__ == '__main__':
-    with open('pijama_config.yaml') as f:
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', default='pijama_config.yaml')
+    args = parser.parse_args()
+    with open(args.config) as f:
         cfg = yaml.safe_load(f)
     main(cfg)

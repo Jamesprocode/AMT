@@ -1,0 +1,34 @@
+# ── Data paths ────────────────────────────────────────────────────────────────
+data_dir: POP909-Dataset/POP909      # folder containing NNN/NNN.mid files
+output_dir: data/pop909-aug5         # where train.txt / valid.txt are written
+
+# ── Preprocessing ─────────────────────────────────────────────────────────────
+augment_factor: 5               # anticipation augmentation (5 = good balance of speed vs diversity)
+valid_ratio: 0.1                # 10% of songs held out for validation (~90 songs)
+seed: 42
+workers: 8
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model: /home/hice1/jwang3180/scratch/AMT/model/music-medium-800k   # base model, NOT pijama finetuned
+lora: false
+checkpoint_dir: /home/hice1/jwang3180/scratch/AMT/checkpoints/pop909-full-aug5
+resume_from_checkpoint: null
+
+# ── Training hyperparameters ──────────────────────────────────────────────────
+epochs: 10
+batch_size: 4
+grad_accum: 8                   # effective batch = 32
+lr: 5.0e-6
+
+# ── Checkpointing ─────────────────────────────────────────────────────────────
+save_steps: 1000
+save_total_limit: 5
+eval_steps: 200
+
+# ── Sampling / logging ────────────────────────────────────────────────────────
+sample_every_steps: 500
+sample_length: 10
+
+# ── W&B ───────────────────────────────────────────────────────────────────────
+wandb_project: amt-pijama
+wandb_run: amt-pop909-full-10ep-aug5
