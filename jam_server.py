@@ -214,7 +214,7 @@ class JamServer:
         client_port: int,
         window_size: float = 6.0,
         phrase_end_silence: float = 1.5,
-        max_phrase_duration: float = 8.0,
+        max_phrase_duration: float = 5.0,
         top_p: float = 0.95,
         temperature: float = 1.0,
         density_adaptive: bool = True,
