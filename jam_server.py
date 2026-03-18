@@ -558,7 +558,7 @@ def main():
     # parser.add_argument("--top-p",       type=float, default=0.95,
     #                     help="Nucleus sampling p (default 0.95)")
     # parser.add_argument("--temperature", type=float, default=1.0,
-    #                     help="Sampling temperature (default 1.0)")
+    #                     help="Sampling temperature (default 1.0
     # args = parser.parse_args()
 
     # model_path = '/data/AMTmodel/music-medium-800k'
