@@ -1,9 +1,9 @@
 # ── Data paths ────────────────────────────────────────────────────────────────
 data_dir: POP909-Dataset/POP909      # folder containing NNN/NNN.mid files
-output_dir: data/pop909        # where train.txt / valid.txt are written
+output_dir: data/pop909       # where train.txt / valid.txt are written
 
 # ── Preprocessing ─────────────────────────────────────────────────────────────
-augment_factor: 1               # anticipation augmentation (5 = good balance of speed vs diversity)
+augment_factor: 3               # anticipation augmentation (5 = good balance of speed vs diversity)
 valid_ratio: 0.1                # 10% of songs held out for validation (~90 songs)
 seed: 42
 workers: 8
@@ -11,7 +11,7 @@ workers: 8
 # ── Model ─────────────────────────────────────────────────────────────────────
 model: /home/hice1/jwang3180/scratch/AMT/model/music-medium-800k   # base model, NOT pijama finetuned
 lora: false
-checkpoint_dir: /home/hice1/jwang3180/scratch/AMT/checkpoints/pop909-full-aug5
+checkpoint_dir: /home/hice1/jwang3180/scratch/AMT/checkpoints/pop909-full-aug3
 resume_from_checkpoint: null
 
 # ── Training hyperparameters ──────────────────────────────────────────────────

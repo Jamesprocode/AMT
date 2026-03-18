@@ -22,6 +22,9 @@ import yaml
 from glob import glob
 from multiprocessing import Pool, cpu_count
 
+import io
+import contextlib
+import mido
 import numpy as np
 from tqdm import tqdm
 
@@ -29,13 +32,33 @@ from anticipation import ops
 from anticipation.config import EVENT_SIZE, M, MAX_TIME
 from anticipation.vocab import SEPARATOR, AUTOREGRESS, ANTICIPATE
 from anticipation.convert import midi_to_compound
-from anticipation.tokenize import maybe_tokenize, extract_spans, extract_random, ANTICIPATION_RATES
+from anticipation.tokenize import maybe_tokenize, extract_instruments, ANTICIPATION_RATES
+
+# POP909 has 3 tracks, all program 0 (piano). Remap each channel to a
+# distinct program so the AMT tokenizer encodes them as separate instruments.
+# Channel 0 = MELODY  → program 52  (Choir Aahs  — voice-like melodic line)
+# Channel 1 = BRIDGE  → program 24  (Acoustic Guitar Nylon — inner voice)
+# Channel 2 = PIANO   → program  0  (Acoustic Grand Piano — chord accompaniment)
+# Piano (program 0) is the accompaniment track so human piano input (instrument 0)
+# in jam_server.py maps naturally to the chord generation role.
+CHANNEL_PROGRAM_REMAP = {0: 52, 1: 24, 2: 0}
+
+
+def remap_programs(midi_path):
+    """Load a POP909 MIDI and reassign program numbers per channel."""
+    mid = mido.MidiFile(midi_path)
+    for track in mid.tracks:
+        for msg in track:
+            if msg.type == 'program_change' and msg.channel in CHANNEL_PROGRAM_REMAP:
+                msg.program = CHANNEL_PROGRAM_REMAP[msg.channel]
+    return mid
 
 
 def process_midi(args):
     midi_path, augment_factor = args
     try:
-        compound = midi_to_compound(midi_path)
+        mid = remap_programs(midi_path)
+        compound = midi_to_compound(mid)
     except Exception:
         return []
     return make_sequences(compound, augment_factor=augment_factor)
@@ -51,21 +74,24 @@ def make_sequences(compound_tokens, augment_factor=1):
     end_time = ops.max_time(all_events, seconds=False)
     z = AUTOREGRESS
 
+    # Three augmentation strategies cycled across passes:
+    #   k % 3 == 0 → melody (52) as control, generate chords + guitar
+    #   k % 3 == 1 → chords (0) as control, generate melody + guitar
+    #   k % 3 == 2 → no control, pure autoregressive (all three tracks free)
+    # Guitar (24) is never used as a control — always a generated voice.
     for k in range(augment_factor):
-        if k % 10 == 0:
-            events = all_events.copy()
-            controls = []
-        elif k % 10 == 1:
-            events, controls = extract_spans(all_events, rate=0.05)
-        elif k % 10 < 6:
-            r = np.random.randint(1, ANTICIPATION_RATES)
-            events, controls = extract_random(all_events, r)
+        mode = k % 3
+        if mode == 0:
+            with contextlib.redirect_stdout(io.StringIO()):
+                events, controls = extract_instruments(all_events, instruments=[52])
+        elif mode == 1:
+            with contextlib.redirect_stdout(io.StringIO()):
+                events, controls = extract_instruments(all_events, instruments=[0])
         else:
-            r = np.random.randint(1, ANTICIPATION_RATES)
-            events, controls = extract_random(all_events, r)
+            events, controls = all_events.copy(), []
 
         if len(concatenated_tokens) == 0:
-            z = ANTICIPATE if k % 10 != 0 else AUTOREGRESS
+            z = ANTICIPATE if mode != 2 else AUTOREGRESS
 
         events = ops.pad(events, end_time)
         tokens, controls = ops.anticipate(events, controls)
@@ -115,7 +141,7 @@ def main(cfg):
 
     for split_name, files, augment in [
         ('train', train_files, cfg['augment_factor']),
-        ('valid', valid_files, 1),
+        ('valid', valid_files, 3),
     ]:
         out_path = os.path.join(cfg['output_dir'], f'{split_name}.txt')
         sequences = []

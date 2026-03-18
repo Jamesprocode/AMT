@@ -22,8 +22,8 @@ import wandb
 from torch.utils.data import Dataset
 from transformers import AutoModelForCausalLM, TrainingArguments, Trainer, TrainerCallback
 
-from anticipation.config import CONTEXT_SIZE
-from anticipation.vocab import VOCAB_SIZE, AUTOREGRESS
+from anticipation.config import CONTEXT_SIZE, TIME_RESOLUTION
+from anticipation.vocab import VOCAB_SIZE, AUTOREGRESS, NOTE_OFFSET, TIME_OFFSET, DUR_OFFSET, CONTROL_OFFSET, MAX_PITCH
 from anticipation.sample import generate
 from anticipation.convert import events_to_midi
 
@@ -60,49 +60,82 @@ class PijamaCallback(TrainerCallback):
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         if metrics and 'eval_loss' in metrics:
-            wandb.log({
-                'eval/perplexity': math.exp(metrics['eval_loss']),
-            })
+            wandb.log({'eval/perplexity': math.exp(metrics['eval_loss'])})
 
     def on_log(self, args, state, control, logs=None, **kwargs):
+        log_dict = {}
         if logs and 'loss' in logs:
-            wandb.log({
-                'train/perplexity': math.exp(logs['loss']),
-            }, step=state.global_step)
+            log_dict['train/perplexity'] = math.exp(logs['loss'])
 
-        # GPU memory
         if torch.cuda.is_available():
-            wandb.log({
-                'system/gpu_memory_allocated_gb': torch.cuda.memory_allocated() / 1e9,
-                'system/gpu_memory_reserved_gb':  torch.cuda.memory_reserved() / 1e9,
-            }, step=state.global_step)
+            log_dict['system/gpu_memory_allocated_gb'] = torch.cuda.memory_allocated() / 1e9
+            log_dict['system/gpu_memory_reserved_gb']  = torch.cuda.memory_reserved()  / 1e9
 
-        # LoRA weight norms — how much the adapters have moved from init
-        lora_norms = {}
         for name, param in self.model.named_parameters():
             if 'lora_' in name and param.requires_grad:
-                lora_norms[f'lora_norms/{name}'] = param.norm().item()
-        if lora_norms:
-            wandb.log(lora_norms, step=state.global_step)
+                log_dict[f'lora_norms/{name}'] = param.norm().item()
+
+        if log_dict:
+            wandb.log(log_dict)
+
+    def _make_controls(self, instrument, pitches, dur_s=0.5):
+        """Build a list of control tokens for a simple melodic line.
+
+        instrument : MIDI program number (52=melody, 0=piano chords)
+        pitches    : list of MIDI pitches played evenly spaced by dur_s seconds
+        """
+        controls = []
+        for i, pitch in enumerate(pitches):
+            t_bins   = int(i * dur_s * TIME_RESOLUTION)
+            d_bins   = max(1, int(dur_s * TIME_RESOLUTION) - 1)
+            note_tok = NOTE_OFFSET + instrument * MAX_PITCH + pitch
+            controls += [
+                CONTROL_OFFSET + TIME_OFFSET + t_bins,
+                CONTROL_OFFSET + DUR_OFFSET  + d_bins,
+                CONTROL_OFFSET + note_tok,
+            ]
+        return controls
 
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step % self.sample_every_steps != 0:
             return
 
+        # Simple C major scale as melody (instrument 52)
+        scale = [60, 62, 64, 65, 67, 69, 71, 72, 71, 69, 67, 65, 64, 62, 60, 60]
+        # Simple C-F-G chord roots as piano (instrument 0)
+        chords = [48, 48, 53, 53, 55, 55, 48, 48]
+
+        melody_ctrl = self._make_controls(52, scale,  dur_s=self.sample_length / len(scale))
+        chord_ctrl  = self._make_controls(0,  chords, dur_s=self.sample_length / len(chords))
+
+        samples = [
+            ('free',        [],           []),
+            ('melody_ctrl', [],           melody_ctrl),
+            ('chord_ctrl',  [],           chord_ctrl),
+        ]
+
         self.model.eval()
+        log_dict = {}
         try:
             with torch.no_grad():
-                events = generate(
-                    self.model,
-                    start_time=0,
-                    end_time=self.sample_length,
-                    top_p=0.98,
-                )
-            mid = events_to_midi(events)
-            path = f'sample_step{state.global_step}.mid'
-            mid.save(path)
-            wandb.log({'samples/midi': wandb.Audio(path, caption=f'step {state.global_step}')},
-                      step=state.global_step)
+                for label, inputs, controls in samples:
+                    events = generate(
+                        self.model,
+                        start_time=0,
+                        end_time=self.sample_length,
+                        inputs=inputs,
+                        controls=controls,
+                        top_p=0.98,
+                    )
+                    # Strip control tokens — they're interleaved in the output
+                    # but events_to_midi doesn't know to ignore them, so they'd
+                    # decode as phantom notes in unintended instrument slots.
+                    events_only = [t for t in events if t < CONTROL_OFFSET]
+                    mid  = events_to_midi(events_only)
+                    path = f'sample_{label}_step{state.global_step}.mid'
+                    mid.save(path)
+                    log_dict[f'samples/{label}'] = wandb.Audio(path, caption=f'{label} step {state.global_step}')
+            wandb.log(log_dict)
         except Exception as e:
             print(f'[PijamaCallback] sample generation failed: {e}')
         finally:
