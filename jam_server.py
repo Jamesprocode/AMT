@@ -14,11 +14,14 @@ OSC in  (port 9000):
     /control/window_size  float       -- seconds per window (default 6.0)
     /control/top_p        float       -- nucleus sampling (default 0.95)
     /control/temperature  float       -- sampling temperature (default 1.0)
+    /control/adaptive     0|1         -- toggle adaptive params (default 1)
 
 OSC out (client port 9001):
     /gen/noteon   pitch velocity channel
     /gen/noteoff  pitch channel
     /gen/status   string
+    /gen/params   temperature top_p   -- current sampling params
+    /gen/scale    root mode oos_ratio -- detected scale (e.g. "C" "dorian" 0.15)
 """
 
 import sys
@@ -51,6 +54,24 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+# ── Scale detection constants ────────────────────────────────────────────────
+
+SCALE_TEMPLATES = {
+    "major":            frozenset({0, 2, 4, 5, 7, 9, 11}),
+    "natural_minor":    frozenset({0, 2, 3, 5, 7, 8, 10}),
+    "dorian":           frozenset({0, 2, 3, 5, 7, 9, 10}),
+    "mixolydian":       frozenset({0, 2, 4, 5, 7, 9, 10}),
+    "harmonic_minor":   frozenset({0, 2, 3, 5, 7, 8, 11}),
+    "pentatonic_major": frozenset({0, 2, 4, 7, 9}),
+    "pentatonic_minor": frozenset({0, 3, 5, 7, 10}),
+    "blues":            frozenset({0, 3, 5, 6, 7, 10}),
+    "whole_tone":       frozenset({0, 2, 4, 6, 8, 10}),
+}
+SCALE_PRIORITY = {name: i for i, name in enumerate(SCALE_TEMPLATES)}
+NOTE_NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+CHROMATIC_THRESHOLD = 0.6
 
 
 # ── Model loader (handles full checkpoints and LoRA adapters) ─────────────────
@@ -217,13 +238,7 @@ class JamServer:
         max_phrase_duration: float = 5.0,
         top_p: float = 0.95,
         temperature: float = 1.0,
-        density_adaptive: bool = True,
-        density_lo: float = 1.0,    # notes/sec considered sparse
-        density_hi: float = 6.0,    # notes/sec considered dense
-        temp_lo: float = 0.5,       # temperature at low density
-        temp_hi: float = 2.0,       # temperature at high density
-        top_p_lo: float = 0.85,     # top_p at low density
-        top_p_hi: float = 0.98,     # top_p at high density
+        adaptive_params: bool = True,
         human_instrument: int = 0,
         min_note_dist_ms: float = 50,
         max_notes_per_onset: int = 4,
@@ -253,14 +268,8 @@ class JamServer:
         self.max_phrase_duration   = max_phrase_duration
         self.top_p                 = top_p
         self.temperature           = temperature
-        self.density_adaptive      = density_adaptive
-        self.density_lo            = density_lo
-        self.density_hi            = density_hi
-        self.temp_lo               = temp_lo
-        self.temp_hi               = temp_hi
-        self.top_p_lo              = top_p_lo
-        self.top_p_hi              = top_p_hi
-        self.human_instrument    = human_instrument
+        self.adaptive_params       = adaptive_params
+        self.human_instrument      = human_instrument
         self.min_note_dist_ms      = min_note_dist_ms
         self.max_notes_per_onset   = max_notes_per_onset
         self.stagger_ms            = stagger_ms
@@ -274,6 +283,10 @@ class JamServer:
         self.shimonize             = shimonize
 
         self._running = False
+        self._current_scale = (None, None)
+        self._current_temperature = temperature
+        self._current_top_p = top_p
+        self._prev_pitches = []
 
     # ── OSC handlers ──────────────────────────────────────────────────────────
 
@@ -332,25 +345,129 @@ class JamServer:
         self.temperature = float(value)
         log.info("temperature → %.3f", self.temperature)
 
-    # ── Density-adaptive sampling ─────────────────────────────────────────────
+    def _on_adaptive(self, address, value):
+        self.adaptive_params = bool(int(value))
+        log.info("adaptive_params → %s", self.adaptive_params)
 
-    def _sampling_params(self, notes: list[tuple], phrase_dur: float) -> tuple[float, float]:
-        """Return (temperature, top_p) scaled by note density of the phrase.
+    # ── Scale detection + adaptive sampling ─────────────────────────────────
 
-        Dense playing (fast runs) → higher temperature + top_p for energetic response.
-        Sparse playing (slow ballad) → lower values for focused, conservative generation.
-        Falls back to manual top_p/temperature if density_adaptive=False.
+    def _detect_scale(self, notes: list[tuple]) -> tuple[str, str | None, float]:
+        """Detect scale/mode from a phrase of MIDI notes.
+
+        Returns (root_name, mode_name, out_of_scale_ratio).
+        Uses duration-weighted pitch class histogram for detection,
+        count-based ratio for the out-of-scale measure.
         """
-        if not self.density_adaptive or phrase_dur <= 0:
-            return self.temperature, self.top_p
+        if not notes:
+            return ("C", "major", 0.0)
 
-        density = len(notes) / phrase_dur   # notes per second
-        # linearly interpolate between lo and hi bounds
-        t = max(0.0, min(1.0, (density - self.density_lo) / max(self.density_hi - self.density_lo, 1e-6)))
-        temperature = self.temp_lo  + t * (self.temp_hi  - self.temp_lo)
-        top_p       = self.top_p_lo + t * (self.top_p_hi - self.top_p_lo)
-        log.info("Density %.2f notes/s → temperature=%.2f  top_p=%.2f", density, temperature, top_p)
-        return temperature, top_p
+        # Duration-weighted pitch class histogram
+        histogram = [0.0] * 12
+        for (_, dur, pitch, _) in notes:
+            histogram[pitch % 12] += dur
+        total_weight = sum(histogram)
+        if total_weight == 0:
+            return ("C", "major", 0.0)
+
+        # Score all 108 candidates (12 roots x 9 templates)
+        candidates = []
+        for name, scale_set in SCALE_TEMPLATES.items():
+            for root in range(12):
+                in_weight = sum(histogram[(root + pc) % 12] for pc in scale_set)
+                coverage = in_weight / total_weight
+                candidates.append((
+                    -coverage,
+                    len(scale_set),
+                    -histogram[root],
+                    SCALE_PRIORITY[name],
+                    root, name, scale_set,
+                ))
+        candidates.sort()
+        _, _, _, _, best_root, best_name, best_set = candidates[0]
+        best_coverage = -candidates[0][0]
+
+        if best_coverage < CHROMATIC_THRESHOLD:
+            return ("chromatic", None, 0.5)
+
+        # Out-of-scale ratio by count
+        out_count = sum(1 for (_, _, p, _) in notes if (p % 12 - best_root) % 12 not in best_set)
+        oos_ratio = out_count / len(notes)
+
+        return (NOTE_NAMES[best_root], best_name, oos_ratio)
+
+    def _repetition_score(self, notes: list[tuple]) -> float:
+        """Compare current phrase's pitch sequence to the previous one.
+
+        Returns [0, 1] where 1 = exact repeat. Uses LCS ratio on pitch classes.
+        """
+        pitches = [p % 12 for (_, _, p, _) in sorted(notes, key=lambda n: n[0])]
+        if not self._prev_pitches or not pitches:
+            self._prev_pitches = pitches
+            return 0.0
+
+        # Longest common subsequence ratio
+        m, n = len(self._prev_pitches), len(pitches)
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if self._prev_pitches[i - 1] == pitches[j - 1]:
+                    dp[i][j] = dp[i - 1][j - 1] + 1
+                else:
+                    dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
+        score = dp[m][n] / max(m, n)
+        self._prev_pitches = pitches
+        return score
+
+    def _sampling_params(self, notes: list[tuple], phrase_dur: float):
+        """Return (temperature, top_p, root, mode, oos_ratio) driven by three factors:
+
+        1. Out-of-scale ratio  — more chromatic = higher temp
+        2. Inverse density     — fewer notes = higher temp
+        3. Repetition          — looping a phrase = higher temp
+
+        Params persist across phrases; only recomputed on key shift or high repetition.
+        """
+        if not self.adaptive_params or len(notes) < 2:
+            return self._current_temperature, self._current_top_p, None, None, 0.0
+
+        root, mode, oos_ratio = self._detect_scale(notes)
+        rep_score = self._repetition_score(notes)
+
+        # Only recompute on key shift or significant repetition
+        key_shifted = (root, mode) != self._current_scale
+        if not key_shifted and rep_score < 0.5:
+            log.info("Scale unchanged (%s %s), low repetition (%.2f) — keeping temp=%.3f top_p=%.3f",
+                     root, mode or "chromatic", rep_score,
+                     self._current_temperature, self._current_top_p)
+            return (self._current_temperature, self._current_top_p,
+                    root, mode, oos_ratio)
+
+        if key_shifted:
+            log.info("Key shift: %s %s → %s %s",
+                     self._current_scale[0], self._current_scale[1],
+                     root, mode or "chromatic")
+            self._current_scale = (root, mode)
+
+        # Factor 1: out-of-scale (more chromatic = higher)
+        # Factor 2: inverse density (fewer notes = higher)
+        density = len(notes) / max(phrase_dur, 0.1)
+        density_norm = max(0.0, min(1.0, (density - 0.5) / 5.5))
+        density_factor = 1.0 - density_norm
+        # Factor 3: repetition (looping = higher)
+
+        adventurousness = 0.4 * oos_ratio + 0.3 * density_factor + 0.3 * rep_score
+
+        temperature = 0.5 + adventurousness * 1.5   # [0.5, 2.0]
+        top_p = 0.85 + adventurousness * 0.15         # [0.85, 1.0]
+
+        self._current_temperature = round(temperature, 3)
+        self._current_top_p = round(top_p, 3)
+
+        log.info("Params: oos=%.2f density=%.1f/s rep=%.2f adv=%.2f → temp=%.3f top_p=%.3f",
+                 oos_ratio, density, rep_score, adventurousness,
+                 self._current_temperature, self._current_top_p)
+        return (self._current_temperature, self._current_top_p,
+                root, mode, oos_ratio)
 
     # ── Generation loop ───────────────────────────────────────────────────────
 
@@ -421,8 +538,10 @@ class JamServer:
                 log.info("  %d notes → continuation [0, %.1f]s", len(notes), phrase_dur)
                 log.info("─────────────────────────────────────────────────")
 
-                temperature, top_p = self._sampling_params(notes, phrase_dur)
+                temperature, top_p, root, mode, oos_ratio = self._sampling_params(notes, phrase_dur)
                 self.client.send_message("/gen/params", [temperature, top_p])
+                if root is not None:
+                    self.client.send_message("/gen/scale", [root, mode or "chromatic", oos_ratio])
                 with torch.no_grad():
                     events = generate(
                         self.model,
@@ -506,6 +625,7 @@ class JamServer:
         disp.map("/control/window_size",    self._on_window_size)
         disp.map("/control/top_p",          self._on_top_p)
         disp.map("/control/temperature",    self._on_temperature)
+        disp.map("/control/adaptive",       self._on_adaptive)
         disp.map("/control/test",           self._on_test)
         disp.set_default_handler(self._on_any)
 
