@@ -59,15 +59,11 @@ log = logging.getLogger(__name__)
 # ── Scale detection constants ────────────────────────────────────────────────
 
 SCALE_TEMPLATES = {
-    "major":            frozenset({0, 2, 4, 5, 7, 9, 11}),
-    "natural_minor":    frozenset({0, 2, 3, 5, 7, 8, 10}),
-    "dorian":           frozenset({0, 2, 3, 5, 7, 9, 10}),
-    "mixolydian":       frozenset({0, 2, 4, 5, 7, 9, 10}),
-    "harmonic_minor":   frozenset({0, 2, 3, 5, 7, 8, 11}),
-    "pentatonic_major": frozenset({0, 2, 4, 7, 9}),
-    "pentatonic_minor": frozenset({0, 3, 5, 7, 10}),
-    "blues":            frozenset({0, 3, 5, 6, 7, 10}),
-    "whole_tone":       frozenset({0, 2, 4, 6, 8, 10}),
+    "major":      frozenset({0, 2, 4, 5, 7, 9, 11}),
+    "minor":      frozenset({0, 2, 3, 5, 7, 8, 10}),
+    "dorian":     frozenset({0, 2, 3, 5, 7, 9, 10}),
+    "mixolydian": frozenset({0, 2, 4, 5, 7, 9, 10}),
+    "lydian":     frozenset({0, 2, 4, 6, 7, 9, 11}),
 }
 SCALE_PRIORITY = {name: i for i, name in enumerate(SCALE_TEMPLATES)}
 NOTE_NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
@@ -234,7 +230,8 @@ class JamServer:
         client_ip: str,
         client_port: int,
         window_size: float = 6.0,
-        phrase_end_silence: float = 1.5,
+        phrase_end_silence: float = 1.0,
+        stop_gesture_timeout: float = 8.0,
         max_phrase_duration: float = 5.0,
         top_p: float = 0.95,
         temperature: float = 1.0,
@@ -265,6 +262,7 @@ class JamServer:
         self.buffer                = NoteBuffer()
         self.window_size           = window_size
         self.phrase_end_silence    = phrase_end_silence
+        self.stop_gesture_timeout = stop_gesture_timeout
         self.max_phrase_duration   = max_phrase_duration
         self.top_p                 = top_p
         self.temperature           = temperature
@@ -286,7 +284,6 @@ class JamServer:
         self._current_scale = (None, None)
         self._current_temperature = temperature
         self._current_top_p = top_p
-        self._prev_pitches = []
 
     # ── OSC handlers ──────────────────────────────────────────────────────────
 
@@ -369,7 +366,7 @@ class JamServer:
         if total_weight == 0:
             return ("C", "major", 0.0)
 
-        # Score all 108 candidates (12 roots x 9 templates)
+        # Score all candidates (5 templates x 12 roots)
         candidates = []
         for name, scale_set in SCALE_TEMPLATES.items():
             for root in range(12):
@@ -389,6 +386,19 @@ class JamServer:
         if best_coverage < CHROMATIC_THRESHOLD:
             return ("chromatic", None, 0.5)
 
+        # If we already have a locked scale, only switch if new one
+        # fits significantly better (15% coverage margin)
+        if self._current_scale != (None, None):
+            cur_root_name, cur_mode = self._current_scale
+            cur_root = NOTE_NAMES.index(cur_root_name) if cur_root_name in NOTE_NAMES else None
+            if cur_root is not None and cur_mode in SCALE_TEMPLATES:
+                cur_set = SCALE_TEMPLATES[cur_mode]
+                cur_weight = sum(histogram[(cur_root + pc) % 12] for pc in cur_set)
+                cur_coverage = cur_weight / total_weight
+                # stick with current scale unless new one is much better
+                if best_coverage < cur_coverage + 0.15:
+                    best_root, best_name, best_set = cur_root, cur_mode, cur_set
+
         # Out-of-scale ratio by count
         out_count = sum(1 for (_, _, p, _) in notes if (p % 12 - best_root) % 12 not in best_set)
         oos_ratio = out_count / len(notes)
@@ -396,27 +406,31 @@ class JamServer:
         return (NOTE_NAMES[best_root], best_name, oos_ratio)
 
     def _repetition_score(self, notes: list[tuple]) -> float:
-        """Compare current phrase's pitch sequence to the previous one.
+        """Detect repetition within the current phrase.
 
-        Returns [0, 1] where 1 = exact repeat. Uses LCS ratio on pitch classes.
+        Tries motif lengths from 2 to len/2 and checks how well the pitch
+        sequence matches when shifted by that period. Returns [0, 1] where
+        1 = perfectly periodic.
         """
         pitches = [p % 12 for (_, _, p, _) in sorted(notes, key=lambda n: n[0])]
-        if not self._prev_pitches or not pitches:
-            self._prev_pitches = pitches
+        n = len(pitches)
+        if n < 4:
+            print(f"[rep] pitches = {pitches}  (too short, score = 0)")
             return 0.0
 
-        # Longest common subsequence ratio
-        m, n = len(self._prev_pitches), len(pitches)
-        dp = [[0] * (n + 1) for _ in range(m + 1)]
-        for i in range(1, m + 1):
-            for j in range(1, n + 1):
-                if self._prev_pitches[i - 1] == pitches[j - 1]:
-                    dp[i][j] = dp[i - 1][j - 1] + 1
-                else:
-                    dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
-        score = dp[m][n] / max(m, n)
-        self._prev_pitches = pitches
-        return score
+        best_score = 0.0
+        best_motif_len = 0
+
+        for motif_len in range(2, n // 2 + 1):
+            matches = sum(1 for i in range(n) if pitches[i] == pitches[i % motif_len])
+            score = matches / n
+            if score > best_score:
+                best_score = score
+                best_motif_len = motif_len
+
+        print(f"[rep] pitches   = {pitches}")
+        print(f"[rep] best motif length = {best_motif_len}  score = {best_score:.3f}")
+        return best_score
 
     def _sampling_params(self, notes: list[tuple], phrase_dur: float):
         """Return (temperature, top_p, root, mode, oos_ratio) driven by three factors:
@@ -448,23 +462,33 @@ class JamServer:
                      root, mode or "chromatic")
             self._current_scale = (root, mode)
 
-        # Factor 1: out-of-scale (more chromatic = higher)
-        # Factor 2: inverse density (fewer notes = higher)
+        # Base: density maps to temperature [0.5, 1.2]
         density = len(notes) / max(phrase_dur, 0.1)
         density_norm = max(0.0, min(1.0, (density - 0.5) / 5.5))
-        density_factor = 1.0 - density_norm
-        # Factor 3: repetition (looping = higher)
+        temperature = 0.5 + density_norm * 0.7
 
-        adventurousness = 0.4 * oos_ratio + 0.3 * density_factor + 0.3 * rep_score
+        # Override: high repetition → 1.9
+        if rep_score > 0.7:
+            temperature = 1.9
+        # Override: chromatic playing → 1.7
+        elif oos_ratio > 0.3:
+            temperature = 1.7
 
-        temperature = 0.5 + adventurousness * 1.5   # [0.5, 2.0]
-        top_p = 0.85 + adventurousness * 0.15         # [0.85, 1.0]
+        top_p = 0.85 + (temperature - 0.5) / 1.5 * 0.15  # scale with temp
 
         self._current_temperature = round(temperature, 3)
         self._current_top_p = round(top_p, 3)
 
-        log.info("Params: oos=%.2f density=%.1f/s rep=%.2f adv=%.2f → temp=%.3f top_p=%.3f",
-                 oos_ratio, density, rep_score, adventurousness,
+        trigger = "repetition" if rep_score > 0.7 else "chromatic" if oos_ratio > 0.3 else "density"
+        print(f"[adaptive] scale        = {root} {mode or 'chromatic'}")
+        print(f"[adaptive] oos_ratio    = {oos_ratio:.3f}")
+        print(f"[adaptive] density      = {density:.2f} notes/s  →  density_norm = {density_norm:.3f}")
+        print(f"[adaptive] rep_score    = {rep_score:.3f}")
+        print(f"[adaptive] trigger      = {trigger}")
+        print(f"[adaptive] temperature  = {self._current_temperature:.3f}  top_p = {self._current_top_p:.3f}")
+
+        log.info("Params: oos=%.2f density=%.1f/s rep=%.2f trigger=%s → temp=%.3f top_p=%.3f",
+                 oos_ratio, density, rep_score, trigger,
                  self._current_temperature, self._current_top_p)
         return (self._current_temperature, self._current_top_p,
                 root, mode, oos_ratio)
@@ -478,10 +502,20 @@ class JamServer:
         """
         # wait for the first note that arrives after we start listening
         wait_start = self.buffer.elapsed()
+        wait_wall = time.time()
+        sent_stop = False
         while self._running:
             last_t = self.buffer.last_event_time()
             if last_t is not None and last_t > wait_start:
+                if sent_stop:
+                    self.client.send_message("/gen/status", ["playing"])
+                    log.info("User resumed — clearing stop")
                 break
+            # no new input — send stop after phrase_end_silence
+            if not sent_stop and (time.time() - wait_wall) >= self.stop_gesture_timeout:
+                self.client.send_message("/gen/status", ["stopped"])
+                log.info("No input — sent stop gesture")
+                sent_stop = True
             time.sleep(0.05)
 
         phrase_start = self.buffer.last_event_time()

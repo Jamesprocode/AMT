@@ -12,48 +12,49 @@ Branch: `main`
 
 ---
 
-## Adaptive Sampling: How Temperature Is Controlled
-
-Replaced the old density-only mapping with a music-theory-driven approach using three signals. Parameters **persist across phrases** and only recompute on key shift or high repetition — no jarring changes within a single key.
+## Adaptive Sampling: Temperature Mapping (WIP)
 
 ### Three factors
 
 | Signal | Direction | Why |
 |--------|-----------|-----|
 | **Out-of-scale notes** | more out-of-scale → higher temp | Chromatic playing = user being adventurous, model should match |
-| **Note density** | more notes → lower temp | Dense playing = user is leading, model follows conservatively |
+| **Note density** | more notes → higher temp | Dense playing = energetic, model should match energy |
 | **Repetition** | repeating phrases → higher temp | User is looping, model should break out and introduce variation |
 
-### Formula
+### Current approach (threshold-based)
+
+Density is the base, with hard overrides:
 
 ```
-adventurousness = 0.4 * oos_ratio + 0.3 * (1 - density_norm) + 0.3 * repetition_score
-
-temperature = 0.5 + adventurousness * 1.5    → range [0.5, 2.0]
-top_p       = 0.85 + adventurousness * 0.15   → range [0.85, 1.0]
+temperature = 0.5 + density_norm * 0.7          base range [0.5, 1.2]
+if rep_score > 0.7:   temperature = 1.9          override: high repetition
+elif oos_ratio > 0.3: temperature = 1.7          override: chromatic playing
 ```
 
-### Scale detection
+### What we tried and why it didn't work
 
-- Builds **duration-weighted** pitch class histogram from the phrase
-- Matches against 9 scale templates x 12 roots = 108 candidates
-- Templates: major, natural minor, dorian, mixolydian, harmonic minor, pentatonic major/minor, blues, whole tone
-- Best match by: coverage → smallest scale on ties → root weight → priority
-- If best coverage < 0.6 → "chromatic" with forced oos_ratio = 0.5
-- Out-of-scale ratio by **note count** (how often the user reaches for chromatic notes)
+| Approach | How | Why it failed |
+|----------|-----|---------------|
+| **Weighted average** | `0.4*oos + 0.3*density + 0.3*rep` | All three average out to ~0.3-0.4 → temp always 0.9-1.1, no dynamic range |
+| **Max wins** | `max(oos, density, rep)` | At least one factor always elevated from noise → temp stays high all the time |
+| **Repetition only** | `adventurousness = rep_score` | False positives in motif detection (chromatic scale scores 0.5), single factor misses other signals |
+| **OOS ratio only** | `adventurousness = oos_ratio` | Scale detection keeps switching mode to fit whatever is played → oos stays near zero |
+| **Interval-based** | avg semitone distance between notes | Reverted — didn't address the core combination problem |
+| **Threshold-based** | density base + rep/oos overrides | Current — still not producing good results |
 
-### Repetition detection
+### Known sub-component issues
 
-- Stores previous phrase's pitch class sequence
-- Computes longest common subsequence (LCS) ratio with current phrase
-- Score 0 = completely different, 1 = exact repeat
-- Only triggers param recomputation when score >= 0.5
+- **Scale detection**: mode switches too often even with sticky scale (15% hysteresis). Reduced to 5 templates (major, minor, dorian, mixolydian, lydian) but still too reactive per-phrase.
+- **Repetition detection**: within-phrase motif matching (`pitches[i] == pitches[i % motif_len]`) has false positives — first motif occurrence trivially matches itself, inflating score.
 
-### When params update
+### Ideas not yet tried
 
-- **Key shift**: detected scale changes (e.g. C major → Eb dorian) → recompute
-- **High repetition**: repetition score >= 0.5 → recompute
-- **Otherwise**: params stay the same — stable behavior within a key
+- Each factor controls its own parameter (rep → temp, oos → top_p, density → gen length)
+- Median of three factors (needs 2/3 to agree)
+- User-set key via OSC (makes oos_ratio reliable)
+- Accumulate histogram across multiple phrases instead of per-phrase
+- Velocity as a signal
 
 ### OSC interface
 
