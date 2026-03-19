@@ -286,7 +286,6 @@ class JamServer:
         self._phrases_in_mode    = 0             # count since last mode switch
         self._min_phrases_switch = 2             # minimum before allowing switch
         self._looped_controls: list[int] = []    # cached control tokens for continuity
-        self._prev_pitches: list[int]    = []    # for repetition detection
         self._mode_override      = "auto"        # OSC manual override
 
     # ── OSC handlers ──────────────────────────────────────────────────────────
@@ -378,23 +377,28 @@ class JamServer:
     # ── Role detection ────────────────────────────────────────────────────────
 
     def _repetition_score(self, notes: list[tuple]) -> float:
-        """LCS ratio between current and previous phrase pitch classes."""
-        current = [pitch % 12 for (_, _, pitch, _) in sorted(notes, key=lambda x: x[0])]
-        prev = self._prev_pitches
-        self._prev_pitches = current
+        """Detect repetition within the current window.
 
-        if not prev or not current:
+        Tries motif lengths from 2 to len/2 and checks how well the pitch
+        sequence matches when shifted by that period. Returns [0, 1] where
+        1 = perfectly periodic.
+        """
+        pitches = [p % 12 for (_, _, p, _) in sorted(notes, key=lambda n: n[0])]
+        n = len(pitches)
+        if n < 4:
             return 0.0
 
-        m, n = len(prev), len(current)
-        dp = [[0] * (n + 1) for _ in range(m + 1)]
-        for i in range(1, m + 1):
-            for j in range(1, n + 1):
-                if prev[i - 1] == current[j - 1]:
-                    dp[i][j] = dp[i - 1][j - 1] + 1
-                else:
-                    dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
-        return dp[m][n] / max(m, n)
+        best_score = 0.0
+        for motif_len in range(2, n // 2 + 1):
+            tail = n - motif_len
+            if tail == 0:
+                continue
+            matches = sum(1 for i in range(motif_len, n) if pitches[i] == pitches[i % motif_len])
+            score = matches / tail
+            if score > best_score:
+                best_score = score
+
+        return best_score
 
     def _detect_role(self, notes: list[tuple]) -> tuple[float, str]:
         """Classify user input as improvisation vs accompaniment.
@@ -417,6 +421,12 @@ class JamServer:
                 onset_groups.append(current_group)
                 current_group = [note]
         onset_groups.append(current_group)
+
+        # If all onsets are single notes → monophonic → user is improvising
+        max_group = max(len(g) for g in onset_groups)
+        if max_group == 1:
+            log.info("Role detection: monophonic input → improv")
+            return (1.0, "improv")
 
         avg_sim = sum(len(g) for g in onset_groups) / len(onset_groups)
         polyphony_norm = max(0.0, min(1.0, (avg_sim - 1.0) / 2.5))
@@ -499,8 +509,11 @@ class JamServer:
 
     # ── Control looping ───────────────────────────────────────────────────────
 
-    def _loop_controls_into_window(self, notes: list[tuple], window_dur: float) -> list[int]:
-        """Repeat user melody pattern cyclically to fill [0, window_dur], return as control tokens."""
+    def _loop_controls_into_window(self, notes: list[tuple], window_dur: float, instrument: int | None = None) -> list[int]:
+        """Repeat user melody pattern cyclically to fill [0, window_dur], return as control tokens.
+
+        If instrument is specified, override the instrument on all notes.
+        """
         if not notes:
             return []
         min_t = min(n[0] for n in notes)
@@ -512,7 +525,7 @@ class JamServer:
             for (t, dur, pitch, instr) in notes:
                 new_t = (t - min_t) + offset
                 if new_t < window_dur:
-                    looped.append((new_t, dur, pitch, instr))
+                    looped.append((new_t, dur, pitch, instrument if instrument is not None else instr))
             offset += pattern_dur
         return notes_to_controls(looped)
 
@@ -565,39 +578,26 @@ class JamServer:
                              t, dur, name, pitch, instr)
                 log.info("─────────────────────────────────────────────────")
 
-                if gen_mode == "anticipate":
-                    # User improvising → model accompanies with looped controls
-                    if key_changed or not self._looped_controls:
-                        self._looped_controls = self._loop_controls_into_window(
-                            notes, self.generation_length)
-                        log.info("  Controls refreshed: %d tokens (looped)",
-                                 len(self._looped_controls))
+                # Always anticipate: user input as controls, model generates the other role
+                # accomp (comping) → controls as piano (0), model generates melody
+                # improv (melody)  → controls as voice (52), model generates chords
+                control_instr = 0 if role_label == "accomp" else 52
 
-                    with torch.no_grad():
-                        events = generate(
-                            self.model,
-                            start_time  = 0,
-                            end_time    = self.generation_length,
-                            inputs      = [],
-                            controls    = self._looped_controls,
-                            top_p       = self.top_p,
-                            temperature = self.temperature,
-                        )
-                else:
-                    # User accompanying → model solos (AUTOREGRESS)
-                    prompt = notes_to_events(notes)
-                    self._looped_controls = []
+                self._looped_controls = self._loop_controls_into_window(
+                    notes, self.generation_length + DELTA, instrument=control_instr)
+                log.info("  Controls: %d tokens (looped, instr=%d)",
+                         len(self._looped_controls), control_instr)
 
-                    with torch.no_grad():
-                        events = generate(
-                            self.model,
-                            start_time  = self.window_size,
-                            end_time    = self.window_size + self.generation_length,
-                            inputs      = prompt,
-                            controls    = [],
-                            top_p       = self.top_p,
-                            temperature = self.temperature,
-                        )
+                with torch.no_grad():
+                    events = generate(
+                        self.model,
+                        start_time  = 0,
+                        end_time    = self.generation_length + DELTA,
+                        inputs      = [],
+                        controls    = self._looped_controls,
+                        top_p       = self.top_p,
+                        temperature = self.temperature,
+                    )
 
             except Exception as exc:
                 log.exception("Generation failed: %s", exc)
@@ -608,6 +608,10 @@ class JamServer:
             gen_elapsed = time.time() - t_gen_start
             n_events = len(events) // 3
             log.info("Window %d: generated %d events in %.2fs", window_num, n_events, gen_elapsed)
+
+            # clip to playback window (discard events beyond generation_length)
+            events = ops.clip(events, 0, self.generation_length,
+                              clip_duration=False, seconds=True)
 
             # decode → (optional shimonization) → schedule
             play_start = time.time()
@@ -738,8 +742,8 @@ def main():
         listen_port         = listen_port,
         client_ip           = client_ip,
         client_port         = client_port,
-        window_size         = 15.0,
-        generation_length   = 15.0,
+        window_size         = 5.0,
+        generation_length   = 5.0,
         key_change_threshold= 0.35,
         top_p               = 0.90,
         temperature         = 0.8,
