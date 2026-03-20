@@ -22,15 +22,32 @@ Branch: `main`
 | **Note density** | more notes → higher temp | Dense playing = energetic, model should match energy |
 | **Repetition** | repeating phrases → higher temp | User is looping, model should break out and introduce variation |
 
-### Current approach (threshold-based)
+### Current approach: MusicalAnalyzer (interval tension + density + cross-phrase repetition)
 
-Density is the base, with hard overrides:
+Replaced per-phrase scale-based detection with a `MusicalAnalyzer` that accumulates across phrases:
 
+**Two blended signals + threshold override:**
 ```
-temperature = 0.5 + density_norm * 0.7          base range [0.5, 1.2]
-if rep_score > 0.7:   temperature = 1.9          override: high repetition
-elif oos_ratio > 0.3: temperature = 1.7          override: chromatic playing
+interval_tension  = EMA of mean interval tension scores across phrases
+density_norm      = notes/sec in current phrase, normalized [0, 1]
+blend             = 0.7 * tension + 0.3 * density_norm
+temperature       = 0.5 + blend * 1.0                  range [0.5, 1.5]
+
+if cross_phrase_rep > 0.7:  temperature = 1.9           override
 ```
+
+**Interval tension scores** (index = semitones):
+| 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12+ |
+|---|---|---|---|---|---|---|---|---|---|----|----|-----|
+| 0.0 | 0.1 | 0.1 | 0.2 | 0.2 | 0.3 | 0.7 | 0.3 | 0.5 | 0.5 | 0.6 | 0.8 | 0.9 |
+
+Stepwise = low (scalar, controlled). Wide leaps/tritones = high (expressive, adventurous).
+
+**Key design changes from previous approach:**
+- Interval tension replaces out-of-scale ratio as the primary signal — measures musical tension directly without needing scale detection
+- Repetition is now cross-phrase (compare latest phrase against phrase memory) instead of within-phrase motif matching — eliminates false positives
+- All signals accumulate across phrases via `MusicalAnalyzer` — scale detection uses a decaying histogram so it stabilizes over time
+- Scale detection still runs for OSC display but no longer drives temperature
 
 ### What we tried and why it didn't work
 
@@ -40,21 +57,14 @@ elif oos_ratio > 0.3: temperature = 1.7          override: chromatic playing
 | **Max wins** | `max(oos, density, rep)` | At least one factor always elevated from noise → temp stays high all the time |
 | **Repetition only** | `adventurousness = rep_score` | False positives in motif detection (chromatic scale scores 0.5), single factor misses other signals |
 | **OOS ratio only** | `adventurousness = oos_ratio` | Scale detection keeps switching mode to fit whatever is played → oos stays near zero |
-| **Interval-based** | avg semitone distance between notes | Reverted — didn't address the core combination problem |
-| **Threshold-based** | density base + rep/oos overrides | Current — still not producing good results |
-
-### Known sub-component issues
-
-- **Scale detection**: mode switches too often even with sticky scale (15% hysteresis). Reduced to 5 templates (major, minor, dorian, mixolydian, lydian) but still too reactive per-phrase.
-- **Repetition detection**: within-phrase motif matching (`pitches[i] == pitches[i % motif_len]`) has false positives — first motif occurrence trivially matches itself, inflating score.
+| **Interval-based (raw)** | avg semitone distance between notes | Reverted — didn't address the core combination problem |
+| **Threshold-based** | density base + rep/oos overrides | OOS unreliable (scale detection too reactive), rep had false positives |
+| **Per-phrase scale detection** | detect key per phrase, measure OOS | "Out of scale" vs "new key" indistinguishable — any rule is wrong half the time |
 
 ### Ideas not yet tried
 
-- Each factor controls its own parameter (rep → temp, oos → top_p, density → gen length)
-- Median of three factors (needs 2/3 to agree)
-- User-set key via OSC (makes oos_ratio reliable)
-- Accumulate histogram across multiple phrases instead of per-phrase
-- Velocity as a signal
+- Each factor controls its own parameter (rep → temp, tension → top_p, density → gen length)
+- Velocity as a signal (loud = intensity → higher top_p)
 
 ### OSC interface
 

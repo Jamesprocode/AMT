@@ -69,6 +69,176 @@ SCALE_PRIORITY = {name: i for i, name in enumerate(SCALE_TEMPLATES)}
 NOTE_NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
 CHROMATIC_THRESHOLD = 0.6
 
+# Interval tension scores — index = semitones (0–12+)
+# Stepwise = low, common leaps = moderate, wide/tense leaps = high
+# Perfect = low, Major = medium, minor = high, tritone = max
+INTERVAL_TENSION = [
+    0.1,  # 0  P1 (unison)          perfect
+    0.7,  # 1  minor 2nd            minor
+    0.5,  # 2  Major 2nd            major
+    0.7,  # 3  minor 3rd            minor
+    0.5,  # 4  Major 3rd            major
+    0.3,  # 5  P4                   perfect
+    0.9,  # 6  Tritone              max tension
+    0.3,  # 7  P5                   perfect
+    0.7,  # 8  minor 6th            minor
+    0.5,  # 9  Major 6th            major
+    0.7,  # 10 minor 7th            minor
+    0.5,  # 11 Major 7th            major
+    0.2,  # 12 P8 (octave)          perfect
+]
+
+
+class MusicalAnalyzer:
+    """Accumulates musical analysis across phrases, independent of window boundaries.
+
+    Provides two signals for temperature mapping:
+    - Interval tension: mean tension of consecutive intervals (accumulated with decay)
+    - Cross-phrase repetition: compares new phrases against recent phrase memory
+    """
+
+    def __init__(self, histogram_decay: float = 0.7, phrase_memory_size: int = 8):
+        self._lock = threading.Lock()
+        self._histogram_decay = histogram_decay
+
+        # Running pitch-class histogram (for scale detection / OSC display)
+        self._histogram = [0.0] * 12
+
+        # Phrase memory for cross-phrase repetition
+        self._phrases: list[list[int]] = []
+        self._max_phrases = phrase_memory_size
+
+        # Accumulated interval tension (exponential moving average)
+        self._tension_ema: float | None = None
+        self._tension_alpha = 0.4  # weight of new phrase vs history
+
+        self._current_scale = (None, None)
+
+    def add_phrase(self, notes: list[tuple]) -> None:
+        """Feed a completed phrase into the analyzer."""
+        with self._lock:
+            # --- pitch histogram (decay + accumulate) ---
+            self._histogram = [h * self._histogram_decay for h in self._histogram]
+            for (_, dur, pitch, _) in notes:
+                self._histogram[pitch % 12] += dur
+
+            # --- interval tension for this phrase ---
+            sorted_notes = sorted(notes, key=lambda n: n[0])
+            pitches = [p for (_, _, p, _) in sorted_notes]
+            phrase_tension = self._compute_tension(pitches)
+            if self._tension_ema is None:
+                self._tension_ema = phrase_tension
+            else:
+                a = self._tension_alpha
+                self._tension_ema = a * phrase_tension + (1 - a) * self._tension_ema
+
+            # --- phrase memory for repetition ---
+            pcs = [p % 12 for p in pitches]
+            self._phrases.append(pcs)
+            if len(self._phrases) > self._max_phrases:
+                self._phrases.pop(0)
+
+    @staticmethod
+    def _compute_tension(pitches: list[int]) -> float:
+        """Interval tension using mean + std dev to capture contrast.
+
+        Pure scalar playing → low std dev → tension ≈ mean (low).
+        Big leaps mixed with steps → high std dev → tension pushed up.
+        """
+        if len(pitches) < 2:
+            return 0.0
+        tensions = []
+        for i in range(1, len(pitches)):
+            semitones = abs(pitches[i] - pitches[i - 1])
+            if semitones >= len(INTERVAL_TENSION):
+                score = INTERVAL_TENSION[-1]  # octave+ → 1.0
+            else:
+                score = INTERVAL_TENSION[semitones]
+            tensions.append(score)
+            print(f"  [tension] {pitches[i-1]} → {pitches[i]}  = {semitones} st  score={score:.2f}")
+        mean = sum(tensions) / len(tensions)
+        variance = sum((t - mean) ** 2 for t in tensions) / len(tensions)
+        std = variance ** 0.5
+        result = min(1.0, mean + std)
+        print(f"  [tension] mean={mean:.3f}  std={std:.3f}  tension={result:.3f}  ({len(tensions)} intervals)")
+        return result
+
+    def interval_tension(self) -> float:
+        """Current accumulated interval tension [0, 1]."""
+        with self._lock:
+            return self._tension_ema if self._tension_ema is not None else 0.0
+
+    def repetition_score(self) -> float:
+        """Compare latest phrase against previous phrases.
+
+        Returns [0, 1] — ratio of matching pitch classes at each position,
+        best match among all previous phrases.
+        """
+        with self._lock:
+            if len(self._phrases) < 2:
+                return 0.0
+            latest = self._phrases[-1]
+            if len(latest) < 3:
+                return 0.0
+
+            best = 0.0
+            for prev in self._phrases[:-1]:
+                if len(prev) < 3:
+                    continue
+                # compare up to the shorter length
+                min_len = min(len(latest), len(prev))
+                matches = sum(1 for i in range(min_len) if latest[i] == prev[i])
+                score = matches / min_len
+                if score > best:
+                    best = score
+            return best
+
+    def detect_scale(self) -> tuple[str, str | None, float]:
+        """Detect scale from the accumulated histogram. Much more stable than per-phrase."""
+        with self._lock:
+            total_weight = sum(self._histogram)
+            if total_weight == 0:
+                return ("C", "major", 0.0)
+
+            candidates = []
+            for name, scale_set in SCALE_TEMPLATES.items():
+                for root in range(12):
+                    in_weight = sum(self._histogram[(root + pc) % 12] for pc in scale_set)
+                    coverage = in_weight / total_weight
+                    candidates.append((
+                        -coverage,
+                        len(scale_set),
+                        -self._histogram[root],
+                        SCALE_PRIORITY[name],
+                        root, name, scale_set,
+                    ))
+            candidates.sort()
+            _, _, _, _, best_root, best_name, best_set = candidates[0]
+            best_coverage = -candidates[0][0]
+
+            if best_coverage < CHROMATIC_THRESHOLD:
+                return ("chromatic", None, 0.5)
+
+            # Sticky scale: only switch if new one fits much better
+            if self._current_scale != (None, None):
+                cur_root_name, cur_mode = self._current_scale
+                cur_root = NOTE_NAMES.index(cur_root_name) if cur_root_name in NOTE_NAMES else None
+                if cur_root is not None and cur_mode in SCALE_TEMPLATES:
+                    cur_set = SCALE_TEMPLATES[cur_mode]
+                    cur_weight = sum(self._histogram[(cur_root + pc) % 12] for pc in cur_set)
+                    cur_coverage = cur_weight / total_weight
+                    if best_coverage < cur_coverage + 0.15:
+                        best_root, best_name, best_set = cur_root, cur_mode, cur_set
+
+            self._current_scale = (NOTE_NAMES[best_root], best_name)
+
+            # OOS ratio by count from accumulated histogram
+            out_weight = sum(self._histogram[pc] for pc in range(12)
+                             if (pc - best_root) % 12 not in best_set)
+            oos_ratio = out_weight / total_weight
+
+            return (NOTE_NAMES[best_root], best_name, oos_ratio)
+
 
 # ── Model loader (handles full checkpoints and LoRA adapters) ─────────────────
 
@@ -281,7 +451,7 @@ class JamServer:
         self.shimonize             = shimonize
 
         self._running = False
-        self._current_scale = (None, None)
+        self._analyzer = MusicalAnalyzer()
         self._current_temperature = temperature
         self._current_top_p = top_p
 
@@ -292,8 +462,8 @@ class JamServer:
         log.info("OSC IN  %s  args=%s", address, args)
 
     def _on_note(self, address, pitch, velocity):
-        label = "ON " if int(velocity) > 0 else "OFF"
-        log.info("MIDI %s  pitch=%d  vel=%d", label, int(pitch), int(velocity))
+        if int(velocity) > 0:
+            log.info("MIDI ON  pitch=%d  vel=%d", int(pitch), int(velocity))
         # auto-start session on first note if not already running
         if not self._running:
             log.info("Auto-starting session on first note")
@@ -307,7 +477,6 @@ class JamServer:
         self._running = True
         self.buffer.start()
         threading.Thread(target=self._generation_loop, daemon=True).start()
-        self.client.send_message("/gen/status", ["session started"])
         log.info("Session started  window=%.1fs  top_p=%.2f  temp=%.2f",
                  self.window_size, self.top_p, self.temperature)
 
@@ -346,149 +515,49 @@ class JamServer:
         self.adaptive_params = bool(int(value))
         log.info("adaptive_params → %s", self.adaptive_params)
 
-    # ── Scale detection + adaptive sampling ─────────────────────────────────
-
-    def _detect_scale(self, notes: list[tuple]) -> tuple[str, str | None, float]:
-        """Detect scale/mode from a phrase of MIDI notes.
-
-        Returns (root_name, mode_name, out_of_scale_ratio).
-        Uses duration-weighted pitch class histogram for detection,
-        count-based ratio for the out-of-scale measure.
-        """
-        if not notes:
-            return ("C", "major", 0.0)
-
-        # Duration-weighted pitch class histogram
-        histogram = [0.0] * 12
-        for (_, dur, pitch, _) in notes:
-            histogram[pitch % 12] += dur
-        total_weight = sum(histogram)
-        if total_weight == 0:
-            return ("C", "major", 0.0)
-
-        # Score all candidates (5 templates x 12 roots)
-        candidates = []
-        for name, scale_set in SCALE_TEMPLATES.items():
-            for root in range(12):
-                in_weight = sum(histogram[(root + pc) % 12] for pc in scale_set)
-                coverage = in_weight / total_weight
-                candidates.append((
-                    -coverage,
-                    len(scale_set),
-                    -histogram[root],
-                    SCALE_PRIORITY[name],
-                    root, name, scale_set,
-                ))
-        candidates.sort()
-        _, _, _, _, best_root, best_name, best_set = candidates[0]
-        best_coverage = -candidates[0][0]
-
-        if best_coverage < CHROMATIC_THRESHOLD:
-            return ("chromatic", None, 0.5)
-
-        # If we already have a locked scale, only switch if new one
-        # fits significantly better (15% coverage margin)
-        if self._current_scale != (None, None):
-            cur_root_name, cur_mode = self._current_scale
-            cur_root = NOTE_NAMES.index(cur_root_name) if cur_root_name in NOTE_NAMES else None
-            if cur_root is not None and cur_mode in SCALE_TEMPLATES:
-                cur_set = SCALE_TEMPLATES[cur_mode]
-                cur_weight = sum(histogram[(cur_root + pc) % 12] for pc in cur_set)
-                cur_coverage = cur_weight / total_weight
-                # stick with current scale unless new one is much better
-                if best_coverage < cur_coverage + 0.15:
-                    best_root, best_name, best_set = cur_root, cur_mode, cur_set
-
-        # Out-of-scale ratio by count
-        out_count = sum(1 for (_, _, p, _) in notes if (p % 12 - best_root) % 12 not in best_set)
-        oos_ratio = out_count / len(notes)
-
-        return (NOTE_NAMES[best_root], best_name, oos_ratio)
-
-    def _repetition_score(self, notes: list[tuple]) -> float:
-        """Detect repetition within the current phrase.
-
-        Tries motif lengths from 2 to len/2 and checks how well the pitch
-        sequence matches when shifted by that period. Returns [0, 1] where
-        1 = perfectly periodic.
-        """
-        pitches = [p % 12 for (_, _, p, _) in sorted(notes, key=lambda n: n[0])]
-        n = len(pitches)
-        if n < 4:
-            print(f"[rep] pitches = {pitches}  (too short, score = 0)")
-            return 0.0
-
-        best_score = 0.0
-        best_motif_len = 0
-
-        for motif_len in range(2, n // 2 + 1):
-            matches = sum(1 for i in range(n) if pitches[i] == pitches[i % motif_len])
-            score = matches / n
-            if score > best_score:
-                best_score = score
-                best_motif_len = motif_len
-
-        print(f"[rep] pitches   = {pitches}")
-        print(f"[rep] best motif length = {best_motif_len}  score = {best_score:.3f}")
-        return best_score
+    # ── Adaptive sampling ────────────────────────────────────────────────────
 
     def _sampling_params(self, notes: list[tuple], phrase_dur: float):
-        """Return (temperature, top_p, root, mode, oos_ratio) driven by three factors:
+        """Return (temperature, top_p, root, mode, oos_ratio).
 
-        1. Out-of-scale ratio  — more chromatic = higher temp
-        2. Inverse density     — fewer notes = higher temp
-        3. Repetition          — looping a phrase = higher temp
-
-        Params persist across phrases; only recomputed on key shift or high repetition.
+        Driven by two blended signals + a threshold override:
+          - 70% interval tension (accumulated across phrases)
+          - 30% note density (current phrase)
+          - Repetition > 0.7 → override temperature to 1.9
         """
         if not self.adaptive_params or len(notes) < 2:
             return self._current_temperature, self._current_top_p, None, None, 0.0
 
-        root, mode, oos_ratio = self._detect_scale(notes)
-        rep_score = self._repetition_score(notes)
+        # Feed phrase into the accumulating analyzer
+        self._analyzer.add_phrase(notes)
 
-        # Only recompute on key shift or significant repetition
-        key_shifted = (root, mode) != self._current_scale
-        if not key_shifted and rep_score < 0.5:
-            log.info("Scale unchanged (%s %s), low repetition (%.2f) — keeping temp=%.3f top_p=%.3f",
-                     root, mode or "chromatic", rep_score,
-                     self._current_temperature, self._current_top_p)
-            return (self._current_temperature, self._current_top_p,
-                    root, mode, oos_ratio)
+        # Signals
+        tension = self._analyzer.interval_tension()
+        rep_score = self._analyzer.repetition_score()
+        root, mode, oos_ratio = self._analyzer.detect_scale()
 
-        if key_shifted:
-            log.info("Key shift: %s %s → %s %s",
-                     self._current_scale[0], self._current_scale[1],
-                     root, mode or "chromatic")
-            self._current_scale = (root, mode)
-
-        # Base: density maps to temperature [0.5, 1.2]
+        # Density: notes per second, normalized to [0, 1]
         density = len(notes) / max(phrase_dur, 0.1)
         density_norm = max(0.0, min(1.0, (density - 0.5) / 5.5))
-        temperature = 0.5 + density_norm * 0.7
 
-        # Override: high repetition → 1.9
+        # Blend: 50% interval tension + 50% density
+        blend = 0.5 * tension + 0.5 * density_norm
+
+        # Map blend [0, 1] → temperature [0.5, 1.9]
+        temperature = 0.5 + blend * 1.4
+
+        # Threshold override: high cross-phrase repetition
         if rep_score > 0.7:
             temperature = 1.9
-        # Override: chromatic playing → 1.7
-        elif oos_ratio > 0.3:
-            temperature = 1.7
 
-        top_p = 0.85 + (temperature - 0.5) / 1.5 * 0.15  # scale with temp
+        top_p = 0.85 + (temperature - 0.5) / 1.5 * 0.15
 
         self._current_temperature = round(temperature, 3)
         self._current_top_p = round(top_p, 3)
 
-        trigger = "repetition" if rep_score > 0.7 else "chromatic" if oos_ratio > 0.3 else "density"
-        print(f"[adaptive] scale        = {root} {mode or 'chromatic'}")
-        print(f"[adaptive] oos_ratio    = {oos_ratio:.3f}")
-        print(f"[adaptive] density      = {density:.2f} notes/s  →  density_norm = {density_norm:.3f}")
-        print(f"[adaptive] rep_score    = {rep_score:.3f}")
-        print(f"[adaptive] trigger      = {trigger}")
-        print(f"[adaptive] temperature  = {self._current_temperature:.3f}  top_p = {self._current_top_p:.3f}")
-
-        log.info("Params: oos=%.2f density=%.1f/s rep=%.2f trigger=%s → temp=%.3f top_p=%.3f",
-                 oos_ratio, density, rep_score, trigger,
+        trigger = "repetition" if rep_score > 0.7 else "blend"
+        log.info("Adaptive: tension=%.3f density=%.1f/s blend=%.3f rep=%.2f trigger=%s → temp=%.3f top_p=%.3f",
+                 tension, density, blend, rep_score, trigger,
                  self._current_temperature, self._current_top_p)
         return (self._current_temperature, self._current_top_p,
                 root, mode, oos_ratio)
@@ -682,6 +751,7 @@ class JamServer:
             log.info("Done")
 
     def _startup_test(self):
+        self.client.send_message("/gen/status", ["sessionstarted"])
         time.sleep(2.0)
         log.info("STARTUP TEST: firing C major arpeggio to %s:%d",
                  self.client._address, self.client._port)
@@ -731,7 +801,7 @@ def main():
         window_size   = 6.0,
         top_p         = 0.95,
         temperature   = 1.0,
-        shimonize= True
+        shimonize= False,  # set True to enable shimonization transforms (octave fold, tremolo, stagger, nudge 
     )
     server.run()
 
