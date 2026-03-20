@@ -139,6 +139,22 @@ class NoteBuffer:
             return 0.0
         return time.time() - self._t0
 
+    def reset(self):
+        """Clear all notes and restart the session clock."""
+        with self._lock:
+            self._pending.clear()
+            self._done.clear()
+            self._t0 = time.time()
+
+    def last_event_time(self) -> float | None:
+        """Return session time of most recent note-on, or None."""
+        with self._lock:
+            if self._done or self._pending:
+                times = [t for (t, *_) in self._done]
+                times += [t for t, _ in self._pending.values()]
+                return max(times) if times else None
+            return None
+
 
 # ── Beat tracker ─────────────────────────────────────────────────────────────
 
@@ -724,6 +740,12 @@ class JamServer:
                  self.priming_bars, priming_dur)
         self.client.send_message("/gen/status", [f"priming: play chords for {self.priming_bars} bars"])
 
+        # Wait for the user to actually start playing before starting timer
+        while self._running and self._priming:
+            if self.buffer.last_event_time() is not None:
+                break
+            time.sleep(0.1)
+
         priming_start = self.buffer.elapsed()
         while self._running and self._priming:
             if self.buffer.elapsed() - priming_start >= priming_dur:
@@ -741,6 +763,45 @@ class JamServer:
 
         # ── Phase 3: Pipeline generation loop ────────────────────────────
         while self._running:
+            # If priming was re-triggered (after silence), wait for new input
+            if self._priming:
+                log.info("Re-entering priming: waiting for user to play…")
+                self.client.send_message("/gen/status", [f"priming: play chords for {self.priming_bars} bars"])
+
+                # Wait for the user to actually start playing
+                while self._running and self._priming:
+                    if self.buffer.last_event_time() is not None:
+                        break
+                    time.sleep(0.1)
+
+                if not self._running:
+                    break
+
+                # Re-estimate tempo from new input
+                bpm = self.beat_tracker.update()
+                bar_dur = self.beat_tracker.bar_duration
+                priming_dur = self.priming_bars * bar_dur
+
+                # Now wait for the priming duration
+                log.info("User started playing — priming for %d bars (%.1fs)", self.priming_bars, priming_dur)
+                priming_start = self.buffer.elapsed()
+                while self._running and self._priming:
+                    self.beat_tracker.update()
+                    if self.buffer.elapsed() - priming_start >= priming_dur:
+                        self._priming = False
+                        log.info("Priming auto-ended after %d bars", self.priming_bars)
+                    else:
+                        time.sleep(0.2)
+                if not self._running:
+                    break
+
+                # Update tempo after priming
+                bpm = self.beat_tracker.update()
+                bar_dur = self.beat_tracker.bar_duration
+                log.info("Post-priming tempo: %.1f BPM (bar=%.2fs)", bpm, bar_dur)
+                self.client.send_message("/gen/status", ["comping: play melody"])
+                gen_end_session = 0.0
+
             # Re-estimate tempo each cycle (micro-tempo tracking)
             bpm = self.beat_tracker.update()
             bar_dur = self.beat_tracker.bar_duration
@@ -779,6 +840,24 @@ class JamServer:
             ctrl_src_end = ctrl_src_start + gen_dur
             ctrl_user_notes = self.buffer.collect_window(ctrl_src_start, ctrl_src_end)
 
+            # Silence detection: if user hasn't played for 2s, reset everything
+            last_note = self.buffer.last_event_time()
+            silence = (self.buffer.elapsed() - last_note) if last_note is not None else 999
+            if silence > 5.0:
+                if gen_end_session != 0.0:  # only log on first detection
+                    log.info("  User silent for %.1fs — stopping playback, clearing history", silence)
+                    if self._current_playback_cancel is not None:
+                        self._current_playback_cancel.set()
+                    # Reset everything: buffer clock, beat tracker, generated history
+                    self.buffer.reset()       # restarts elapsed() from 0
+                    self.beat_tracker.reset()  # clear stale onsets + BPM
+                    self.gen_history.clear()
+                    gen_end_session = 0.0
+                    self._priming = True
+                    self.client.send_message("/gen/status", ["waiting — play to restart"])
+                time.sleep(0.5)
+                continue
+
             # ── History: user notes as piano(0) + model output ─────────────
             hist_limit = max(0.0, gen_start_session - self.history_bars * bar_dur)
             user_raw = self.buffer.collect_window(hist_limit, max(hist_limit, ctrl_src_end))
@@ -799,11 +878,18 @@ class JamServer:
                 log.warning("Clamped history to %.1fs to stay within MAX_TIME", actual_hist_dur)
 
             all_events = user_hist + model_hist
-            inputs = notes_to_events(all_events)
 
-            if not inputs:
+            if not all_events:
                 actual_hist_dur = 0.0
                 hist_start = gen_start_session
+                inputs = []
+            else:
+                # Shift events so first note starts at t=0, no wasted REST padding
+                t_min = min(n[0] for n in all_events)
+                all_events = [(t - t_min, d, p, i) for (t, d, p, i) in all_events]
+                actual_hist_dur = max(n[0] + n[1] for n in all_events)
+                hist_start = gen_start_session - actual_hist_dur
+                inputs = notes_to_events(all_events)
 
             # ── Melody controls: top note from control window ─────────────
             ctrl_melody = extract_top_melody(ctrl_user_notes)
@@ -931,8 +1017,13 @@ class JamServer:
             # We want notes at model time actual_hist_dur to play at wall-clock gen_start_session
             # But gen_start_session is in the future relative to elapsed
             # play_offset = wall clock time corresponding to session time gen_start_session
+            # If we're late (generation took too long), play from now instead of the past
             now_session = self.buffer.elapsed()
             play_offset = time.time() + (gen_start_session - now_session)
+            if play_offset < time.time():
+                late_by = time.time() - play_offset
+                log.warning("  Late by %.2fs — shifting playback to now", late_by)
+                play_offset = time.time()
             schedule = notes_to_schedule(decoded, play_offset, win_start=actual_hist_dur)
 
             # Cancel old playback on key change
@@ -1025,14 +1116,14 @@ def main():
         listen_port         = listen_port,
         client_ip           = client_ip,
         client_port         = client_port,
-        gen_bars            = 4,
+        gen_bars            = 8,
         history_bars        = 8,
         beats_per_bar       = 4,
         default_bpm         = 120.0,
         latency_bars        = 1,
         key_change_threshold= 0.35,
-        top_p               = 0.90,
-        temperature         = 0.8,
+        top_p               = 0.98,
+        temperature         = 1.0,
         human_instrument    = 52,   # POP909 melody = program 52 (Choir Aahs)
         shimonize           = False,
     )
