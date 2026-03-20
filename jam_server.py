@@ -130,6 +130,21 @@ class NoteBuffer:
 
 # ── Token helpers ─────────────────────────────────────────────────────────────
 
+def notes_to_events(notes: list[tuple]) -> list[int]:
+    """Convert (t_rel, dur, pitch, instrument) list → regular AMT event tokens."""
+    events = []
+    for (t, dur, pitch, instr) in notes:
+        t_bins = min(int(t * TIME_RESOLUTION), MAX_TIME - 1)
+        d_bins = min(int(dur * TIME_RESOLUTION), MAX_DUR - 1)
+        note_v = pitch + instr * MAX_PITCH
+        events.extend([
+            TIME_OFFSET + t_bins,
+            DUR_OFFSET  + d_bins,
+            NOTE_OFFSET + note_v,
+        ])
+    return ops.sort(events)
+
+
 def notes_to_controls(notes: list[tuple]) -> list[int]:
     """Convert (t_rel, dur, pitch, instrument) list → anticipatory control tokens.
 
@@ -338,6 +353,9 @@ class JamServer:
 
     def _generation_loop(self):
         window_num = 0
+        # Accumulated history: list of (t, dur, pitch, instrument) in model time
+        # Contains both previous user input (as events) and previous model output
+        history_notes = []
 
         while self._running:
             # wait for one full window of human input
@@ -359,29 +377,57 @@ class JamServer:
 
             key_changed = self._detect_key_change(notes)
 
+            # Build controls from current window user notes (times relative to 0)
+            controls = notes_to_controls(notes)
+
+            note_names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
+            log.info("── CONTROLS (%d notes) ─────────────────────────", len(notes))
+            for (t, dur, pitch, instr) in sorted(notes, key=lambda x: x[0]):
+                name = note_names[pitch % 12] + str(pitch // 12 - 1)
+                log.info("  t=%5.2fs  dur=%.2fs  %s (pitch=%d  instr=%d)",
+                         t, dur, name, pitch, instr)
+
+            if window_num == 0 or not history_notes:
+                # First window: controls only, no history
+                inputs = []
+                start_time = 0
+                end_time = self.generation_length
+                log.info("Window %d: controls-only, generate [0, %.1f]s", window_num, end_time)
+            else:
+                # Later windows: model output only as history (no user notes)
+                # Keep last 2x generation_length
+                max_hist_dur = self.generation_length * 2
+                hist_max_t = max(n[0] + n[1] for n in history_notes)
+                cutoff = max(0, hist_max_t - max_hist_dur)
+                hist = [(t, d, p, i) for (t, d, p, i) in history_notes if t >= cutoff]
+                if hist:
+                    t_min = min(n[0] for n in hist)
+                    hist = [(t - t_min, d, p, i) for (t, d, p, i) in hist]
+
+                # Also cap by note count — keep max 100 notes (300 tokens)
+                if len(hist) > 100:
+                    hist = hist[-100:]
+                    t_min = min(n[0] for n in hist)
+                    hist = [(t - t_min, d, p, i) for (t, d, p, i) in hist]
+
+                inputs = notes_to_events(hist) if hist else []
+                hist_dur = max(n[0] + n[1] for n in hist) if hist else 0
+                start_time = hist_dur
+                end_time = hist_dur + self.generation_length
+                log.info("Window %d: history=%d notes (%.1fs), generate [%.1f, %.1f]s, inputs=%d tokens, controls=%d tokens",
+                         window_num, len(hist), hist_dur, start_time, end_time, len(inputs), len(controls))
+
             log.info("Window %d: %d notes – generating %.1fs of accompaniment …",
                      window_num, len(notes), self.generation_length)
             t_gen_start = time.time()
 
             try:
-                controls = notes_to_controls(notes)
-
-                note_names = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
-                log.info("── CONTROLS ──────────────────────────────────────")
-                for (t, dur, pitch, instr) in sorted(notes, key=lambda x: x[0]):
-                    name = note_names[pitch % 12] + str(pitch // 12 - 1)
-                    log.info("  t=%5.2fs  dur=%.2fs  %s (pitch=%d  instr=%d)",
-                             t, dur, name, pitch, instr)
-                log.info("  %d notes → accompaniment [0, %.1f]s",
-                         len(notes), self.generation_length)
-                log.info("─────────────────────────────────────────────────")
-
                 with torch.no_grad():
                     events = generate(
                         self.model,
-                        start_time  = 0,
-                        end_time    = self.generation_length,
-                        inputs      = [],
+                        start_time  = start_time,
+                        end_time    = end_time,
+                        inputs      = inputs,
                         controls    = controls,
                         top_p       = self.top_p,
                         temperature = self.temperature,
@@ -393,14 +439,24 @@ class JamServer:
                 continue
 
             gen_elapsed = time.time() - t_gen_start
-            n_events = len(events) // 3
+
+            # Clip to just the new generation window
+            continuation = ops.clip(events, start_time, end_time,
+                                    clip_duration=False, seconds=True)
+            n_events = len(continuation) // 3
             log.info("Window %d: generated %d events in %.2fs", window_num, n_events, gen_elapsed)
+
+            # Decode generated events
+            decoded = decode_events(continuation)
+
+            # Accumulate history: model output only (no user notes)
+            for (t, d, p, i) in decoded:
+                history_notes.append((t, d, p, i))
 
             # decode → (optional shimonization) → schedule
             play_start = time.time()
             t0 = time.time()
 
-            decoded = decode_events(events)
             t1 = time.time(); log.info("  pipeline  decode_events  : %5.3f ms  (%d notes)", (t1-t0)*1e3, len(decoded))
 
             if self.shimonize:
@@ -424,7 +480,7 @@ class JamServer:
             else:
                 log.info("  pipeline  shimonize=False – skipping transforms")
 
-            schedule = notes_to_schedule(decoded, play_start, 0.0)
+            schedule = notes_to_schedule(decoded, play_start, start_time)
             t7 = time.time(); log.info("  pipeline  notes_to_sched : %5.3f ms", (t7-t1)*1e3)
             # cancel old playback now that new one is ready — no silence gap
             if key_changed and self._current_playback_cancel is not None:
@@ -512,7 +568,7 @@ def main():
     #                     help="Sampling temperature (default 1.0)")
     # args = parser.parse_args()
 
-    model_path = '/data/AMTmodel/pop909_10epfinal'
+    model_path = '/data/AMTmodel/pop909_10epfinal'     # faster inference, worse sample quality
     client_ip = "192.168.1.2"
     listen_ip = "192.168.1.10"
     client_port = 9001
@@ -524,11 +580,11 @@ def main():
         listen_port         = listen_port,
         client_ip           = client_ip,
         client_port         = client_port,
-        window_size         = 15.0,
-        generation_length   = 15.0,
+        window_size         = 3.0,
+        generation_length   = 6.0,
         key_change_threshold= 0.35,
-        top_p               = 0.90,
-        temperature         = 0.8,
+        top_p               = 0.98,
+        temperature         = 1.0,
         shimonize           = False,
     )
     server.run()
