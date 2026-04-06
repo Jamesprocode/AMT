@@ -801,7 +801,7 @@ def main():
         window_size   = 6.0,
         top_p         = 0.95,
         temperature   = 1.0,
-        shimonize= False,  # set True to enable shimonization transforms (octave fold, tremolo, stagger, nudge 
+        shimonize= True,  # set True to enable shimonization transforms (octave fold, tremolo, stagger, nudge 
     )
     server.run()
 
