@@ -283,6 +283,7 @@ class JamServer:
         self.shimonize             = shimonize
 
         self._running = False
+        self._first_note_seen = False
         self._current_scale = (None, None)
         self._current_temperature = temperature
         self._current_top_p = top_p
@@ -301,6 +302,11 @@ class JamServer:
         if not self._running:
             log.info("Auto-starting session on first note")
             self._on_start(address)
+        # fire "played" once, on the first note-on of this session
+        if int(velocity) > 0 and not self._first_note_seen:
+            self._first_note_seen = True
+            self.client.send_message("/gen/status", ["played"])
+            log.info("First note played → /gen/status played")
         self.buffer.note_event(int(pitch), int(velocity), self.human_instrument)
 
     def _on_start(self, address, *args):
@@ -308,9 +314,10 @@ class JamServer:
             log.info("Already running – ignoring /control/start")
             return
         self._running = True
+        self._first_note_seen = False
         self.buffer.start()
         threading.Thread(target=self._generation_loop, daemon=True).start()
-        self.client.send_message("/gen/status", ["played"])
+        self.client.send_message("/gen/status", ["started"])
         log.info("Session started  window=%.1fs  top_p=%.2f  temp=%.2f",
                  self.window_size, self.top_p, self.temperature)
 
@@ -648,6 +655,7 @@ class JamServer:
             log.info("Done")
 
     def _startup_test(self):
+        self._on_start("/gen/status/started")
         time.sleep(2.0)
         log.info("STARTUP TEST: firing C major arpeggio to %s:%d",
                  self.client._address, self.client._port)
@@ -657,7 +665,7 @@ class JamServer:
             time.sleep(0.3)
             self.client.send_message("/gen/noteoff", [pitch, 2])
         log.info("STARTUP TEST done – if Max heard 4 notes the return path is working")
-        self._on_start("/gen/status/started")
+        
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
