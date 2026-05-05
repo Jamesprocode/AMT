@@ -419,6 +419,8 @@ class JamServer:
 
             if silence >= self.phrase_end_silence:
                 log.info("Phrase ended — silence %.2fs >= %.2fs", silence, self.phrase_end_silence)
+                self.client.send_message("/gen/status", ["silence"])
+
                 return phrase_start, last_t
 
             if duration >= self.max_phrase_duration:
