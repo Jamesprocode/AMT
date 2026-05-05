@@ -374,10 +374,9 @@ class JamServer:
         rep_score = self._repetition_score(notes)
 
         density = len(notes) / max(phrase_dur, 0.1)
-        density_norm = max(0.0, min(1.0, (density - 0.5) / 5.5))
-        density_factor = 1.0 - density_norm   # sparse=1, dense=0
+        density_norm = max(0.0, min(1.0, (density - 0.5) / 5.5))   # sparse=0, dense=1
 
-        temperature = 0.8 + density_factor * 0.4   # [0.8, 1.2]
+        temperature = 0.8 + density_norm * 0.4   # [0.8, 1.2]
 
         if rep_score > 0.7:
             temperature = 1.19
@@ -618,7 +617,7 @@ def main():
         listen_port   = listen_port,
         client_ip     = client_ip,
         client_port   = client_port,
-        window_size   = 6.0,
+        window_size   = 4.0,
         top_p         = 0.95,
         temperature   = 1.0,
         shimonize= True
