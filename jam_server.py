@@ -21,7 +21,6 @@ OSC out (client port 9001):
     /gen/noteoff  pitch channel
     /gen/status   string
     /gen/params   temperature top_p   -- current sampling params
-    /gen/scale    root mode oos_ratio -- detected scale (e.g. "C" "dorian" 0.15)
 """
 
 import sys
@@ -54,24 +53,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
-
-# ── Scale detection constants ────────────────────────────────────────────────
-
-SCALE_TEMPLATES = {
-    "major":            frozenset({0, 2, 4, 5, 7, 9, 11}),
-    "natural_minor":    frozenset({0, 2, 3, 5, 7, 8, 10}),
-    "dorian":           frozenset({0, 2, 3, 5, 7, 9, 10}),
-    "mixolydian":       frozenset({0, 2, 4, 5, 7, 9, 10}),
-    "harmonic_minor":   frozenset({0, 2, 3, 5, 7, 8, 11}),
-    "pentatonic_major": frozenset({0, 2, 4, 7, 9}),
-    "pentatonic_minor": frozenset({0, 3, 5, 7, 10}),
-    "blues":            frozenset({0, 3, 5, 6, 7, 10}),
-    "whole_tone":       frozenset({0, 2, 4, 6, 8, 10}),
-}
-SCALE_PRIORITY = {name: i for i, name in enumerate(SCALE_TEMPLATES)}
-NOTE_NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
-CHROMATIC_THRESHOLD = 0.6
 
 
 # ── Model loader (handles full checkpoints and LoRA adapters) ─────────────────
@@ -284,7 +265,6 @@ class JamServer:
 
         self._running = False
         self._first_note_seen = False
-        self._current_scale = (None, None)
         self._current_temperature = temperature
         self._current_top_p = top_p
         self._prev_pitches = []
@@ -356,51 +336,7 @@ class JamServer:
         self.adaptive_params = bool(int(value))
         log.info("adaptive_params → %s", self.adaptive_params)
 
-    # ── Scale detection + adaptive sampling ─────────────────────────────────
-
-    def _detect_scale(self, notes: list[tuple]) -> tuple[str, str | None, float]:
-        """Detect scale/mode from a phrase of MIDI notes.
-
-        Returns (root_name, mode_name, out_of_scale_ratio).
-        Uses duration-weighted pitch class histogram for detection,
-        count-based ratio for the out-of-scale measure.
-        """
-        if not notes:
-            return ("C", "major", 0.0)
-
-        # Duration-weighted pitch class histogram
-        histogram = [0.0] * 12
-        for (_, dur, pitch, _) in notes:
-            histogram[pitch % 12] += dur
-        total_weight = sum(histogram)
-        if total_weight == 0:
-            return ("C", "major", 0.0)
-
-        # Score all 108 candidates (12 roots x 9 templates)
-        candidates = []
-        for name, scale_set in SCALE_TEMPLATES.items():
-            for root in range(12):
-                in_weight = sum(histogram[(root + pc) % 12] for pc in scale_set)
-                coverage = in_weight / total_weight
-                candidates.append((
-                    -coverage,
-                    len(scale_set),
-                    -histogram[root],
-                    SCALE_PRIORITY[name],
-                    root, name, scale_set,
-                ))
-        candidates.sort()
-        _, _, _, _, best_root, best_name, best_set = candidates[0]
-        best_coverage = -candidates[0][0]
-
-        if best_coverage < CHROMATIC_THRESHOLD:
-            return ("chromatic", None, 0.5)
-
-        # Out-of-scale ratio by count
-        out_count = sum(1 for (_, _, p, _) in notes if (p % 12 - best_root) % 12 not in best_set)
-        oos_ratio = out_count / len(notes)
-
-        return (NOTE_NAMES[best_root], best_name, oos_ratio)
+    # ── Adaptive sampling ───────────────────────────────────────────────────
 
     def _repetition_score(self, notes: list[tuple]) -> float:
         """Compare current phrase's pitch sequence to the previous one.
@@ -426,55 +362,36 @@ class JamServer:
         return score
 
     def _sampling_params(self, notes: list[tuple], phrase_dur: float):
-        """Return (temperature, top_p, root, mode, oos_ratio) driven by three factors:
+        """Return (temperature, top_p) driven by note density, with a
+        repetition threshold override.
 
-        1. Out-of-scale ratio  — more chromatic = higher temp
-        2. Inverse density     — fewer notes = higher temp
-        3. Repetition          — looping a phrase = higher temp
-
-        Params persist across phrases; only recomputed on key shift or high repetition.
+        - Sparse playing → higher temp; dense playing → lower temp.
+        - Cross-phrase repetition > 0.7 → temperature override to 1.19.
         """
         if not self.adaptive_params or len(notes) < 2:
-            return self._current_temperature, self._current_top_p, None, None, 0.0
+            return self._current_temperature, self._current_top_p
 
-        root, mode, oos_ratio = self._detect_scale(notes)
         rep_score = self._repetition_score(notes)
 
-        # Only recompute on key shift or significant repetition
-        key_shifted = (root, mode) != self._current_scale
-        if not key_shifted and rep_score < 0.5:
-            log.info("Scale unchanged (%s %s), low repetition (%.2f) — keeping temp=%.3f top_p=%.3f",
-                     root, mode or "chromatic", rep_score,
-                     self._current_temperature, self._current_top_p)
-            return (self._current_temperature, self._current_top_p,
-                    root, mode, oos_ratio)
-
-        if key_shifted:
-            log.info("Key shift: %s %s → %s %s",
-                     self._current_scale[0], self._current_scale[1],
-                     root, mode or "chromatic")
-            self._current_scale = (root, mode)
-
-        # Factor 1: out-of-scale (more chromatic = higher)
-        # Factor 2: inverse density (fewer notes = higher)
         density = len(notes) / max(phrase_dur, 0.1)
         density_norm = max(0.0, min(1.0, (density - 0.5) / 5.5))
-        density_factor = 1.0 - density_norm
-        # Factor 3: repetition (looping = higher)
+        density_factor = 1.0 - density_norm   # sparse=1, dense=0
 
-        adventurousness = 0.4 * oos_ratio + 0.3 * density_factor + 0.3 * rep_score
+        temperature = 0.8 + density_factor * 0.4   # [0.8, 1.2]
 
-        temperature = 0.8 + adventurousness * 0.4    # [0.8, 1.2]
-        top_p = 0.90 + adventurousness * 0.1         # [0.90, 1.00]
+        if rep_score > 0.7:
+            temperature = 1.19
+
+        top_p = 0.90 + (temperature - 0.8) / 0.4 * 0.1   # [0.90, 1.00]
 
         self._current_temperature = round(temperature, 3)
         self._current_top_p = round(top_p, 3)
 
-        log.info("Params: oos=%.2f density=%.1f/s rep=%.2f adv=%.2f → temp=%.3f top_p=%.3f",
-                 oos_ratio, density, rep_score, adventurousness,
+        trigger = "repetition" if rep_score > 0.7 else "density"
+        log.info("Params: density=%.1f/s rep=%.2f trigger=%s → temp=%.3f top_p=%.3f",
+                 density, rep_score, trigger,
                  self._current_temperature, self._current_top_p)
-        return (self._current_temperature, self._current_top_p,
-                root, mode, oos_ratio)
+        return self._current_temperature, self._current_top_p
 
     # ── Generation loop ───────────────────────────────────────────────────────
 
@@ -545,10 +462,8 @@ class JamServer:
                 log.info("  %d notes → continuation [0, %.1f]s", len(notes), phrase_dur)
                 log.info("─────────────────────────────────────────────────")
 
-                temperature, top_p, root, mode, oos_ratio = self._sampling_params(notes, phrase_dur)
+                temperature, top_p = self._sampling_params(notes, phrase_dur)
                 self.client.send_message("/gen/params", [temperature, top_p])
-                if root is not None:
-                    self.client.send_message("/gen/scale", [root, mode or "chromatic", oos_ratio])
                 with torch.no_grad():
                     events = generate(
                         self.model,
