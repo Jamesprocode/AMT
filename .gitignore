@@ -14,3 +14,5 @@ midi_melody_extraction/
 POP909-Dataset/
 data/
 max/
+audiotomidi.py
+demos.py
