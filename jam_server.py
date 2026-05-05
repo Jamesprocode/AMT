@@ -310,7 +310,7 @@ class JamServer:
         self._running = True
         self.buffer.start()
         threading.Thread(target=self._generation_loop, daemon=True).start()
-        self.client.send_message("/gen/status", ["session started"])
+        self.client.send_message("/gen/status", ["played"])
         log.info("Session started  window=%.1fs  top_p=%.2f  temp=%.2f",
                  self.window_size, self.top_p, self.temperature)
 
@@ -457,8 +457,8 @@ class JamServer:
 
         adventurousness = 0.4 * oos_ratio + 0.3 * density_factor + 0.3 * rep_score
 
-        temperature = 0.5 + adventurousness * 1.5   # [0.5, 2.0]
-        top_p = 0.85 + adventurousness * 0.15         # [0.85, 1.0]
+        temperature = 0.8 + adventurousness * 0.4    # [0.8, 1.2]
+        top_p = 0.90 + adventurousness * 0.1         # [0.90, 1.00]
 
         self._current_temperature = round(temperature, 3)
         self._current_top_p = round(top_p, 3)
@@ -657,6 +657,7 @@ class JamServer:
             time.sleep(0.3)
             self.client.send_message("/gen/noteoff", [pitch, 2])
         log.info("STARTUP TEST done – if Max heard 4 notes the return path is working")
+        self._on_start("/gen/status/started")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
