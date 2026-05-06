@@ -285,12 +285,15 @@ class JamPlanner:
             # The striker_arm's actual struck pitch (might be octave-shifted).
             actual_pitch = state.struck_pitches[striker_arm]
             mask = striker_bitmask(striker_arm, actual_pitch)
-            pos = _striker_position_mm(self.midi_velocity)
             striker_send_t = audible_t - STRIKE_TIME_S
+            # 4-arg MIDI striker form: ['s' = Strike mode, mask, velocity,
+            # channel]. Bound on the Pi via setStrikerMidiCallback in
+            # ArmController::init(); fires the proper down-blend-up trajectory
+            # (same trajectory the original 2-arg /arm MIDI path was using).
             schedule.append((
                 striker_send_t,
                 "/striker",
-                [int(mask), int(pos), 0],   # time_ms=0 → fire on receipt
+                ['s', int(mask), int(self.midi_velocity), 0],
             ))
 
             prev_state = state
