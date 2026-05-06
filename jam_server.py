@@ -266,7 +266,6 @@ class JamServer:
         self.shimonize             = shimonize
 
         self._running = False
-        self._first_note_seen = False
         self._current_temperature = temperature
         self._current_top_p = top_p
         self._prev_pitches = []
@@ -291,7 +290,6 @@ class JamServer:
             log.info("Already running – ignoring /control/start")
             return
         self._running = True
-        self._first_note_seen = False
         self.buffer.start()
         threading.Thread(target=self._generation_loop, daemon=True).start()
         self.client.send_message("/gen/status", ["started"])
@@ -410,7 +408,6 @@ class JamServer:
                 if idle >= self.silence_timeout:
                     log.info("User idle %.1fs ≥ %.1fs → /gen/status rest", idle, self.silence_timeout)
                     self.client.send_message("/gen/status", ["rest"])
-                    self._first_note_seen = False
                     idle_fired = True
             time.sleep(0.05)
 
@@ -470,6 +467,7 @@ class JamServer:
 
                 temperature, top_p = self._sampling_params(notes, phrase_dur)
                 self.client.send_message("/gen/params", [temperature, top_p])
+                self.client.send_message("/gen/status", ["played"])
                 with torch.no_grad():
                     events = generate(
                         self.model,
@@ -539,11 +537,6 @@ class JamServer:
             now = time.time()
             if target_time > now:
                 time.sleep(target_time - now)
-            # fire "played" once, on the very first generated note of the session
-            if address == "/gen/noteon" and not self._first_note_seen:
-                self._first_note_seen = True
-                self.client.send_message("/gen/status", ["played"])
-                log.info("First generated note → /gen/status played")
             log.info("  → %s %s", address, args)
             self.client.send_message(address, args)
         log.info("Playback: done")
