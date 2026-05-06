@@ -76,7 +76,7 @@ class JamPlanner:
         self,
         pitch_range: tuple[int, int] = (48, 95),
         max_states_per_pitch: int = 100,
-        beam_width: int = 100,
+        beam_width: int = 50,
         octave_range: int = 2,
         cost_model: CostModel | None = None,
         midi_velocity: int = 80,
@@ -143,13 +143,18 @@ class JamPlanner:
             play_start=play_start, win_start=win_start, lead_in_s=lead_in_s,
         )
 
-        # Persist for next phrase. Use the LAST non-skip state as the
-        # carry-forward (skips don't move arms; the carrier underneath is
-        # what the robot is actually at).
-        for state, was_skip in zip(reversed(result.path), reversed(result.is_skip)):
-            if not was_skip:
-                self.last_state = state
-                break
+        # Persist for next phrase. Use _actual_final_state set by
+        # _build_schedule, which reflects the *commanded* end position of
+        # each arm — accounting for any /arm that got skipped due to motion
+        # infeasibility. Falls back to the last non-skip state if the
+        # schedule was empty (no moves attempted).
+        if hasattr(self, "_actual_final_state"):
+            self.last_state = self._actual_final_state
+        else:
+            for state, was_skip in zip(reversed(result.path), reversed(result.is_skip)):
+                if not was_skip:
+                    self.last_state = state
+                    break
 
         n_oct = sum(
             1 for state, was_skip, p in zip(result.path, result.is_skip, pitches)
@@ -244,6 +249,10 @@ class JamPlanner:
                 dt_s = max(notes[i][0] - notes[i - 1][0], 0.001)
             dt_ms = max(1, int(round(dt_s * 1000)))
 
+            # Per-arm: try to dispatch a move. Track which arms successfully
+            # got an /arm so we know what `actual_state` is for the next
+            # iteration (a skipped /arm means that arm physically stays put).
+            actual_positions = list(prev_state.positions_mm)
             for arm_id in range(4):
                 if state.positions_mm[arm_id] == prev_state.positions_mm[arm_id]:
                     continue
@@ -253,7 +262,9 @@ class JamPlanner:
                 except ValueError as e:
                     # Should be rare since Viterbi already gated feasibility,
                     # but timing rounding could push us over. Skip the move
-                    # rather than send an invalid command.
+                    # rather than send an invalid command — and leave this
+                    # arm's actual_position at prev_state so prev_state stays
+                    # honest about where the arm physically is.
                     log.warning("Motion params infeasible for arm %d (%dmm in %dms): %s",
                                 arm_id, dist, dt_ms, e)
                     continue
@@ -266,6 +277,20 @@ class JamPlanner:
                      float(acc_g),                          # g
                      int(round(v_max))],                    # mm/s
                 ))
+                actual_positions[arm_id] = state.positions_mm[arm_id]
+            actual_tuple = tuple(actual_positions)
+            # Defensive: if mixing prev+planned per-arm violates strictly
+            # increasing (rare, only when one arm's move was skipped while
+            # another moves past its old slot), fall back to the planned
+            # state for continuity. The invariant has to hold or downstream
+            # State helpers will choke.
+            if all(actual_tuple[i] < actual_tuple[i + 1] for i in range(3)):
+                actual_state = State(positions_mm=actual_tuple)
+            else:
+                log.warning("hybrid actual_state %s would violate ordering; "
+                            "falling back to planned state %s",
+                            actual_tuple, state.positions_mm)
+                actual_state = state
 
             # /striker: choreo format. Find which arm strikes the (possibly
             # octave-shifted) pitch.
@@ -296,7 +321,11 @@ class JamPlanner:
                 ['s', int(mask), int(self.midi_velocity), 0],
             ))
 
-            prev_state = state
+            prev_state = actual_state
+
+        # Record the actual final state so the next phrase's planner reads
+        # truth, not the planned-but-not-sent path's last node.
+        self._actual_final_state = prev_state
 
         schedule.sort(key=lambda x: x[0])
         return schedule

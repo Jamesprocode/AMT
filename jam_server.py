@@ -239,7 +239,7 @@ class JamServer:
         shimonize: bool = True,
         use_viterbi: bool = True,
         viterbi_max_states_per_pitch: int = 100,
-        viterbi_beam_width: int = 100,
+        viterbi_beam_width: int = 50,
         viterbi_octave_range: int = 2,
         phrase_lead_in_s: float = PHRASE_LEAD_IN_S,
     ):
