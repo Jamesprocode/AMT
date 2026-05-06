@@ -467,7 +467,9 @@ class JamServer:
 
                 temperature, top_p = self._sampling_params(notes, phrase_dur)
                 self.client.send_message("/gen/params", [temperature, top_p])
-                self.client.send_message("/gen/status", ["played"])
+                # only retrigger the regular gesture when below the special-gesture threshold
+                if temperature < 1.2:
+                    self.client.send_message("/gen/status", ["played"])
                 with torch.no_grad():
                     events = generate(
                         self.model,
