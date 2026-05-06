@@ -410,6 +410,7 @@ class JamServer:
                 if idle >= self.silence_timeout:
                     log.info("User idle %.1fs ≥ %.1fs → /gen/status rest", idle, self.silence_timeout)
                     self.client.send_message("/gen/status", ["rest"])
+                    self._first_note_seen = False
                     idle_fired = True
             time.sleep(0.05)
 
