@@ -30,7 +30,10 @@ MEAN_BAR_WIDTH_MM = 29.0  # mean of diffs in NOTE_POSITIONS_MM
 
 # Hardware limits from pi-shimon/Include/Def.h
 VELOCITY_LIMIT_MM_PER_S = 2500.0   # VELOCITY_LIMIT = 2.5 m/s
-ACC_LIMIT_G = 2.5                  # was 3.0; lowered to reduce overshoot.
+ACC_LIMIT_G = 1.0                  # per-arm. With 4 arms simultaneously this is
+                                   # ≤4g aggregate vs the old single-arm 3g, keeping
+                                   # peak current draw within what one-arm-at-a-time
+                                   # operation tested.
 G_MM_PER_S2 = 9800.0               # 9.8 m/s^2 in mm/s^2
 
 # Safety margin: only schedule moves that fit within SAFETY_FACTOR of the
