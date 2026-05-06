@@ -32,15 +32,18 @@ MAX_NOTE = 95
 NUM_ARMS = 4
 
 # kBoundaries[i] = (left_gap_mm, right_gap_mm) required for arm i.
-# Mirrors kBoundaries in pi-shimon/Include/Def.h (arm 1/2 inner gap = 160mm).
+# Inter-arm gaps are widened by 20mm over the C++ kBoundaries values to
+# absorb overshoot/settle slop from the IAI controller. Wall gaps stay at
+# 0 — the rail extends past the extreme bars on hardware, so we don't need
+# to forbid arm 0 from mm=0 or arm 3 from mm=1385.
 ARM_GAPS: tuple[tuple[int, int], ...] = (
-    (0, 40),
-    (40, 160),
-    (160, 40),
-    (40, 0),
+    (0, 60),
+    (60, 180),
+    (180, 60),
+    (60, 0),
 )
 
-HOME_POSITIONS_MM: tuple[int, int, int, int] = (0, 50, 1345, 1385)
+HOME_POSITIONS_MM: tuple[int, int, int, int] = (44, 434, 894, 1240)
 
 
 # --------------------------------------------------------------------------
@@ -249,13 +252,10 @@ class StateSpace:
 
 
 def home_state() -> State:
-    """A canonical start state at the C++ home positions."""
-    # Home positions 0 and 1385 are exact bar positions (MIDI 48 and 95).
-    # 50 and 1345 are NOT bar positions; snap to nearest bars for a valid state.
-    def snap_to_bar(mm: int) -> int:
-        return min(NOTE_POSITIONS_MM, key=lambda b: abs(b - mm))
-
-    snapped = tuple(snap_to_bar(p) for p in HOME_POSITIONS_MM)
-    # Enforce strictly increasing after snapping (should already be true).
-    assert snapped[0] < snapped[1] < snapped[2] < snapped[3], snapped
-    return State(positions_mm=snapped)
+    """Canonical start state — arms spread across the rail at MIDI pitches
+    50/62/77/86 (D3/D4/F5/D6). Bars all on exact positions so no snap is
+    needed. The startup routine should physically move the arms here via
+    raw /arm before the first phrase plays."""
+    assert (HOME_POSITIONS_MM[0] < HOME_POSITIONS_MM[1]
+            < HOME_POSITIONS_MM[2] < HOME_POSITIONS_MM[3]), HOME_POSITIONS_MM
+    return State(positions_mm=HOME_POSITIONS_MM)

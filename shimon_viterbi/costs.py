@@ -50,7 +50,7 @@ class CostModel:
     # otherwise-equivalent paths. The robot is allowed to move more if that
     # means hitting more exact notes.
     alpha: float = 1.0           # emission weight (exact-pitch hit)
-    lambda_: float = 0.5         # perceptual penalty (>1 arm moved monophonically)
+    lambda_: float = 3.0         # perceptual penalty (>1 arm moved monophonically)
     omega: float = 0.02          # efficiency penalty per bar-width moved (tie-breaker only)
     beta_octave: float = 2.0     # penalty per |octave| of fallback shift
     gamma_drop: float = 10.0     # penalty for skipping a note (rest fallback)

@@ -75,7 +75,7 @@ class JamPlanner:
     def __init__(
         self,
         pitch_range: tuple[int, int] = (48, 95),
-        max_states_per_pitch: int = 50,
+        max_states_per_pitch: int = 100,
         beam_width: int = 100,
         octave_range: int = 2,
         cost_model: CostModel | None = None,

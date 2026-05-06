@@ -48,6 +48,8 @@ from anticipation.sample import generate
 
 from shimon_filter import filter_notes, octave_fold, expand_tremolo, nudge_runs, stagger_chords
 from shimon_viterbi import JamPlanner, PHRASE_LEAD_IN_S
+from shimon_viterbi.state_space import HOME_POSITIONS_MM
+from shimon_viterbi.motion import compute_motion_params
 
 logging.basicConfig(
     level=logging.INFO,
@@ -236,7 +238,7 @@ class JamServer:
         run_semitones: int = 3,
         shimonize: bool = True,
         use_viterbi: bool = True,
-        viterbi_max_states_per_pitch: int = 50,
+        viterbi_max_states_per_pitch: int = 100,
         viterbi_beam_width: int = 100,
         viterbi_octave_range: int = 2,
         phrase_lead_in_s: float = PHRASE_LEAD_IN_S,
@@ -617,16 +619,27 @@ class JamServer:
             log.info("Done")
 
     def _startup_test(self):
-        self._on_start("/gen/status/started")
         time.sleep(2.0)
-        log.info("STARTUP TEST: firing C major arpeggio to %s:%d",
-                 self.client._address, self.client._port)
-        for pitch in [50, 62, 77, 86]:
-            self.client.send_message("/gen/noteon",  [pitch, 100, 2])
-            log.info("  → /gen/noteon [pitch=%d vel=100 ch=2]", pitch)
-            time.sleep(0.3)
-            self.client.send_message("/gen/noteoff", [pitch, 2])
-        log.info("STARTUP TEST done – if Max heard 4 notes the return path is working")
+        # Physically move all four arms to the planner's home positions via
+        # raw /arm. This is what `home_state()` assumes the robot is at when
+        # planning the first phrase.
+        log.info("STARTUP: moving arms to home %s", HOME_POSITIONS_MM)
+        move_time_ms = 1500
+        for arm_id, target_mm in enumerate(HOME_POSITIONS_MM):
+            try:
+                acc_g, v_max = compute_motion_params(target_mm, move_time_ms) \
+                    if target_mm > 0 else (0.0, 0.0)
+            except ValueError as e:
+                log.warning("home move infeasible for arm %d: %s", arm_id, e)
+                continue
+            self.client.send_message("/arm", [
+                arm_id + 1, int(target_mm), float(acc_g), int(round(v_max)),
+            ])
+            log.info("  → /arm [arm=%d pos=%d acc=%.2fg v=%d]",
+                     arm_id + 1, target_mm, acc_g, int(round(v_max)))
+        time.sleep(move_time_ms / 1000.0 + 0.5)
+        self._on_start("/gen/status/started")
+        log.info("STARTUP done – arms at home, session started")
         
 
 
