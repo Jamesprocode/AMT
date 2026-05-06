@@ -30,10 +30,13 @@ MEAN_BAR_WIDTH_MM = 29.0  # mean of diffs in NOTE_POSITIONS_MM
 
 # Hardware limits from pi-shimon/Include/Def.h
 VELOCITY_LIMIT_MM_PER_S = 2500.0   # VELOCITY_LIMIT = 2.5 m/s
-ACC_LIMIT_G = 1.0                  # per-arm. With 4 arms simultaneously this is
-                                   # ≤4g aggregate vs the old single-arm 3g, keeping
-                                   # peak current draw within what one-arm-at-a-time
-                                   # operation tested.
+ACC_LIMIT_G = 4.0                  # per-arm cap. Matches aggregate budget so
+                                   # a single-arm move can use the full envelope.
+                                   # Multi-arm moves are then bounded by the
+                                   # aggregate cap below.
+AGGREGATE_ACC_BUDGET_G = 4.0       # Sum of acc_g across moving arms must stay
+                                   # under this. Prevents brownouts when 2-4
+                                   # arms accelerate concurrently.
 G_MM_PER_S2 = 9800.0               # 9.8 m/s^2 in mm/s^2
 
 # Safety margin: only schedule moves that fit within SAFETY_FACTOR of the
@@ -59,6 +62,7 @@ class CostModel:
     gamma_drop: float = 10.0     # penalty for skipping a note (rest fallback)
     velocity_mm_per_s: float = VELOCITY_LIMIT_MM_PER_S * SAFETY_FACTOR
     acc_g: float = ACC_LIMIT_G * SAFETY_FACTOR
+    aggregate_acc_g: float = AGGREGATE_ACC_BUDGET_G * SAFETY_FACTOR
 
     # ------------------------------------------------------------------
     # Eq 1 — emission (with octave fallback)
@@ -105,7 +109,9 @@ class CostModel:
         # formula in pi-shimon/Shimon/Src/ArmController/Include/Arm.h:181.
         v_lim_mm_s = self.velocity_mm_per_s
         a_lim_mm_s2 = self.acc_g * G_MM_PER_S2
+        agg_lim_mm_s2 = self.aggregate_acc_g * G_MM_PER_S2
 
+        a_sum = 0.0
         for n in range(NUM_ARMS):
             dist = abs(k.positions_mm[n] - j.positions_mm[n])
             if dist == 0:
@@ -126,6 +132,12 @@ class CostModel:
             a_required = (v_peak * v_peak) / denom
             if a_required > a_lim_mm_s2:
                 return False
+            a_sum += a_required
+
+        # Aggregate cap: sum of per-arm accelerations stays under PSU budget.
+        # Prevents bus-voltage sag from concurrent multi-arm starts.
+        if a_sum > agg_lim_mm_s2:
+            return False
         return True
 
     # ------------------------------------------------------------------
@@ -253,6 +265,12 @@ class CostModel:
 
         arm_infeasible = moved & ((denom <= 0.0) | (a_required > a_lim))
         pair_infeasible = arm_infeasible.any(axis=2)  # (V, B)
+
+        # Aggregate-acc cap (PSU budget across simultaneously moving arms).
+        agg_lim = float(self.aggregate_acc_g) * G_MM_PER_S2
+        a_required_clipped = np.where(moved, a_required, 0.0)
+        a_sum = a_required_clipped.sum(axis=2)        # (V, B)
+        pair_infeasible = pair_infeasible | (a_sum > agg_lim)
 
         arms_moved = moved.sum(axis=2)                # (V, B)
         total_mm = dist.sum(axis=2)                   # (V, B)
