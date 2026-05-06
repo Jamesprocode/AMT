@@ -217,6 +217,7 @@ class JamServer:
         window_size: float = 6.0,
         phrase_end_silence: float = 1.5,
         max_phrase_duration: float = 5.0,
+        silence_timeout: float = 8.0,
         top_p: float = 0.95,
         temperature: float = 1.0,
         adaptive_params: bool = True,
@@ -247,6 +248,7 @@ class JamServer:
         self.window_size           = window_size
         self.phrase_end_silence    = phrase_end_silence
         self.max_phrase_duration   = max_phrase_duration
+        self.silence_timeout       = silence_timeout
         self.top_p                 = top_p
         self.temperature           = temperature
         self.adaptive_params       = adaptive_params
@@ -398,13 +400,23 @@ class JamServer:
         """Block until the user pauses for phrase_end_silence seconds or max_phrase_duration is hit.
 
         Returns (phrase_start, phrase_end) as session-relative times.
+        Also fires /gen/status "rest" once if the user is silent for silence_timeout seconds.
         """
         # wait for the first note that arrives after we start listening
         wait_start = self.buffer.elapsed()
+        idle_fired = False
         while self._running:
             last_t = self.buffer.last_event_time()
             if last_t is not None and last_t > wait_start:
                 break
+            # detect prolonged user silence (Max should stop the gesture)
+            if not idle_fired and last_t is not None:
+                idle = self.buffer.elapsed() - last_t
+                if idle >= self.silence_timeout:
+                    log.info("User idle %.1fs ≥ %.1fs → /gen/status rest", idle, self.silence_timeout)
+                    self.client.send_message("/gen/status", ["rest"])
+                    self._first_note_seen = False
+                    idle_fired = True
             time.sleep(0.05)
 
         phrase_start = self.buffer.last_event_time()
@@ -419,8 +431,6 @@ class JamServer:
 
             if silence >= self.phrase_end_silence:
                 log.info("Phrase ended — silence %.2fs >= %.2fs", silence, self.phrase_end_silence)
-                self.client.send_message("/gen/status", ["silence"])
-
                 return phrase_start, last_t
 
             if duration >= self.max_phrase_duration:
