@@ -265,8 +265,12 @@ class JamPlanner:
                     # rather than send an invalid command — and leave this
                     # arm's actual_position at prev_state so prev_state stays
                     # honest about where the arm physically is.
-                    log.warning("Motion params infeasible for arm %d (%dmm in %dms): %s",
-                                arm_id, dist, dt_ms, e)
+                    log.error("!! ARM %d MOVE SKIPPED: motion params infeasible "
+                              "(%dmm in %dms): %s — arm will be left at %dmm "
+                              "while planner expected %dmm",
+                              arm_id, dist, dt_ms, e,
+                              prev_state.positions_mm[arm_id],
+                              state.positions_mm[arm_id])
                     continue
                 arm_send_t = audible_t - lead_in_s
                 schedule.append((
@@ -287,9 +291,11 @@ class JamPlanner:
             if all(actual_tuple[i] < actual_tuple[i + 1] for i in range(3)):
                 actual_state = State(positions_mm=actual_tuple)
             else:
-                log.warning("hybrid actual_state %s would violate ordering; "
-                            "falling back to planned state %s",
-                            actual_tuple, state.positions_mm)
+                log.error("!! HYBRID STATE INVALID — actual %s violates ordering "
+                          "(some /arm was skipped while another arm moved past "
+                          "its old slot); falling back to planned %s. Arms may "
+                          "now be in physically inconsistent positions.",
+                          actual_tuple, state.positions_mm)
                 actual_state = state
 
             # /striker: choreo format. Find which arm strikes the (possibly

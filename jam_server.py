@@ -578,12 +578,24 @@ class JamServer:
     def _playback_thread(self, schedule: list[tuple]):
         log.info("Playback: sending %d OSC messages to %s:%d",
                  len(schedule), self.client._address, self.client._port)
+        late_arm_count = 0
         for (target_time, address, args) in schedule:
             now = time.time()
             if target_time > now:
                 time.sleep(target_time - now)
+            else:
+                lateness_ms = (now - target_time) * 1000.0
+                if address == "/arm" and lateness_ms > 50:
+                    late_arm_count += 1
+                    log.error("!! /arm SENT %.0fms LATE — arm %s lead-in eaten "
+                              "(generation+viterbi took longer than play_start "
+                              "anticipated). Arms may not arrive before strike.",
+                              lateness_ms, args[0] if args else "?")
             log.info("  → %s %s", address, args)
             self.client.send_message(address, args)
+        if late_arm_count:
+            log.error("!! Playback: %d /arm messages were sent late this phrase",
+                      late_arm_count)
         log.info("Playback: done")
 
     # ── Start OSC server ──────────────────────────────────────────────────────
