@@ -14,7 +14,8 @@ from state_space import StateSpace, State, home_state, pitch_to_mm
 from viterbi import viterbi_decode
 
 
-def plan_melody(melody: list[tuple[float, int]], pitch_range=(60, 71)):
+def plan_melody(melody: list[tuple[float, int]], pitch_range=(60, 71),
+                allow_skip: bool = True, octave_range: int = 2):
     """melody: list of (onset_s, pitch). Returns ViterbiResult."""
     ss = StateSpace(pitch_range=pitch_range)
     cm = CostModel()
@@ -23,12 +24,11 @@ def plan_melody(melody: list[tuple[float, int]], pitch_range=(60, 71)):
     # state whose striker happens to play the range's low pitch.
     start = ss.beam_for_pitch[pitch_range[0]][0]
 
-    # Convert melody to (obs_index, pitch) observations and a timing array.
     pitches = [p for _, p in melody]
     onsets = [t for t, _ in melody]
 
     def beam_fn(pitch):
-        return ss.beam_fn(pitch)
+        return ss.extended_beam_fn(pitch, octave_range=octave_range)
 
     def emission_fn(state, pitch):
         return cm.emission(state, pitch)
@@ -40,12 +40,15 @@ def plan_melody(melody: list[tuple[float, int]], pitch_range=(60, 71)):
             dt = onsets[step_idx] - onsets[step_idx - 1]
         return cm.transition(prev, curr, dt)
 
+    skip = (lambda state, pitch: cm.skip_score(state, pitch)) if allow_skip else None
+
     return ss, viterbi_decode(
         observations=pitches,
         start_state=start,
         beam_fn=beam_fn,
         emission_fn=emission_fn,
         transition_fn=transition_fn,
+        skip_score_fn=skip,
     )
 
 
@@ -63,15 +66,16 @@ def test_ascending_triad():
         match = "OK" if state.struck_pitch == pitch else "MISS"
         print(f"  step {t}: {state} -> plays MIDI {state.struck_pitch} (target {pitch}) [{match}]")
     print(f"total score: {result.total_score:.3f}")
-    print(f"dropped: {result.dropped}")
+    print(f"skipped: {result.skipped}")
 
-    # Correctness: each returned state must play the target pitch.
-    for state, pitch in zip(result.path, [60, 64, 67]):
+    # Correctness: each returned state must play the target pitch (no skips, no octave shift).
+    for state, pitch, was_skip in zip(result.path, [60, 64, 67], result.is_skip):
+        assert not was_skip, f"step should not be skipped"
         assert state.struck_pitch == pitch, \
             f"state plays {state.struck_pitch}, expected {pitch}"
     # Total score should be positive (3 emission hits dominate small efficiency penalty).
     assert result.total_score > 0
-    assert result.dropped == []
+    assert result.skipped == []
 
 
 def test_repeated_note_no_movement():
@@ -80,10 +84,44 @@ def test_repeated_note_no_movement():
     ss, result = plan_melody(melody, pitch_range=(60, 71))
     assert result.path[0] == result.path[1], \
         f"arms shouldn't move for repeat: {result.path}"
+    assert result.is_skip == [False, False], "neither step should be a skip"
+
+
+def test_octave_fallback_when_pitch_unreachable():
+    """Pitch 71 isn't reachable inside [60,67] beam — Viterbi should fall back
+    to the same pitch class one octave down (59) — wait, also outside range.
+    With range (60,71) and target 60, no octave shift is in range; we use
+    a wider range here to actually exercise octave fallback."""
+    # Restrict pitch range so that target 72 isn't directly reachable.
+    # We allow 60..71 in the state space, so 72 must fall back to 60 (-1 oct).
+    # The test asserts the path strikes pitch 60 (octave-shifted hit) instead of skipping.
+    melody = [(0.0, 60), (0.4, 72)]
+    ss, result = plan_melody(melody, pitch_range=(60, 71), octave_range=2)
+    print(f"octave fallback path: {[(s.struck_pitch, sk) for s, sk in zip(result.path, result.is_skip)]}")
+    # Step 1's struck pitch should be 60 (the only pitch class reachable that's
+    # an octave-multiple of 72 in [60,71]). Crucially, NOT skipped.
+    assert result.is_skip == [False, False], f"got is_skip={result.is_skip}"
+    assert result.path[1].struck_pitch == 60, \
+        f"expected fallback to 60, got {result.path[1].struck_pitch}"
+
+
+def test_skip_chosen_when_unreachable():
+    """Pitch 100 is outside the entire 88-key range. With no octave fallback in
+    range, the only option is skip. Path should remain at start_state."""
+    melody = [(0.0, 60), (0.3, 100)]
+    ss, result = plan_melody(melody, pitch_range=(60, 71), octave_range=0)
+    print(f"skip path: {[(s.struck_pitch if not sk else 'SKIP', sk) for s, sk in zip(result.path, result.is_skip)]}")
+    assert result.is_skip[0] is False
+    assert result.is_skip[1] is True
+    assert result.path[1] == result.path[0], "skip should keep arms at previous state"
 
 
 if __name__ == "__main__":
     test_ascending_triad()
     print()
     test_repeated_note_no_movement()
+    print()
+    test_octave_fallback_when_pitch_unreachable()
+    print()
+    test_skip_chosen_when_unreachable()
     print("All integration tests passed.")

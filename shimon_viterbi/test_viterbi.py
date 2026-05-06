@@ -66,7 +66,8 @@ def test_viterbi_escapes_greedy_trap():
     )
     assert result.path == ["1b", "2b", "3b"], f"got {result.path}"
     assert result.total_score == -4, f"got {result.total_score}"
-    assert result.dropped == []
+    assert result.skipped == []
+    assert result.is_skip == [False, False, False]
 
 
 def test_viterbi_single_observation():
@@ -126,9 +127,50 @@ def test_viterbi_beats_greedy_on_same_problem():
     assert viterbi_result.total_score > greedy_score
 
 
+def test_viterbi_skip_chosen_when_beam_costs_more():
+    """When a feasible hit costs -3 but skip costs -2, Viterbi must pick skip."""
+    transitions = {
+        ("start", "a"): -3,    # only state available, expensive
+    }
+    beam = {0: ["a"]}
+    skip_score = -2.0  # less bad than the beam transition
+
+    result = viterbi_decode(
+        observations=[0],
+        start_state="start",
+        beam_fn=lambda o: beam[o],
+        emission_fn=lambda s, o: 0.0,
+        transition_fn=lambda p, c, t: transitions.get((p, c), -inf),
+        skip_score_fn=lambda s, o: skip_score,
+    )
+    assert result.path == ["start"], f"got {result.path}"
+    assert result.is_skip == [True]
+    assert result.skipped == [0]
+    assert result.total_score == skip_score
+
+
+def test_viterbi_real_hit_beats_skip_when_cheaper():
+    """When the beam transition costs -1 and skip costs -2, real hit wins."""
+    transitions = {("start", "a"): -1}
+    beam = {0: ["a"]}
+
+    result = viterbi_decode(
+        observations=[0],
+        start_state="start",
+        beam_fn=lambda o: beam[o],
+        emission_fn=lambda s, o: 0.0,
+        transition_fn=lambda p, c, t: transitions.get((p, c), -inf),
+        skip_score_fn=lambda s, o: -2.0,
+    )
+    assert result.path == ["a"]
+    assert result.is_skip == [False]
+
+
 if __name__ == "__main__":
     test_viterbi_escapes_greedy_trap()
     test_viterbi_single_observation()
     test_viterbi_empty()
     test_viterbi_beats_greedy_on_same_problem()
+    test_viterbi_skip_chosen_when_beam_costs_more()
+    test_viterbi_real_hit_beats_skip_when_cheaper()
     print("All Viterbi tests passed.")

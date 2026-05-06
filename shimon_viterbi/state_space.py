@@ -28,10 +28,11 @@ MAX_NOTE = 95
 NUM_ARMS = 4
 
 # kBoundaries[i] = (left_gap_mm, right_gap_mm) required for arm i.
+# Mirrors kBoundaries in pi-shimon/Include/Def.h (arm 1/2 inner gap = 160mm).
 ARM_GAPS: tuple[tuple[int, int], ...] = (
     (0, 40),
-    (40, 150),
-    (150, 40),
+    (40, 160),
+    (160, 40),
     (40, 0),
 )
 
@@ -121,7 +122,22 @@ class StateSpace:
         return len(self.states)
 
     def beam_fn(self, pitch: int) -> list[State]:
+        """Exact-pitch beam: states whose striker hits exactly `pitch`."""
         return self.beam_for_pitch.get(pitch, [])
+
+    def extended_beam_fn(self, pitch: int, octave_range: int = 2) -> list[State]:
+        """Beam including octave-shifted candidates up to ±octave_range.
+
+        Out-of-range octaves (outside [MIN_NOTE, MAX_NOTE]) are silently
+        dropped. The cost model handles the per-octave penalty via emission().
+        """
+        beam: list[State] = []
+        for k in range(-octave_range, octave_range + 1):
+            shifted = pitch + 12 * k
+            if shifted < self.pitch_range[0] or shifted > self.pitch_range[1]:
+                continue
+            beam.extend(self.beam_for_pitch.get(shifted, []))
+        return beam
 
 
 def home_state() -> State:
