@@ -1,4 +1,5 @@
 """
+good version with greedy path planning
 AMT Jam Server
 Runs on the GPU machine. Receives human MIDI notes via OSC,
 generates accompaniment with the Anticipatory Music Transformer,
