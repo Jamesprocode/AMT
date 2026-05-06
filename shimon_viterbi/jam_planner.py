@@ -272,7 +272,10 @@ class JamPlanner:
             striker_arm = state.striker_for(pitch)
             if striker_arm is None:
                 for k in (1, -1, 2, -2):
-                    striker_arm = state.striker_for(pitch + 12 * k)
+                    try:
+                        striker_arm = state.striker_for(pitch + 12 * k)
+                    except ValueError:
+                        continue
                     if striker_arm is not None:
                         break
             if striker_arm is None:
