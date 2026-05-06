@@ -218,8 +218,8 @@ class JamServer:
         phrase_end_silence: float = 1.5,
         max_phrase_duration: float = 5.0,
         silence_timeout: float = 8.0,
-        top_p: float = 0.95,
-        temperature: float = 1.0,
+        top_p: float = 0.90,
+        temperature: float = 0.8,
         adaptive_params: bool = True,
         human_instrument: int = 0,
         min_note_dist_ms: float = 50,
@@ -284,11 +284,6 @@ class JamServer:
         if not self._running:
             log.info("Auto-starting session on first note")
             self._on_start(address)
-        # fire "played" once, on the first note-on of this session
-        if int(velocity) > 0 and not self._first_note_seen:
-            self._first_note_seen = True
-            self.client.send_message("/gen/status", ["played"])
-            log.info("First note played → /gen/status played")
         self.buffer.note_event(int(pitch), int(velocity), self.human_instrument)
 
     def _on_start(self, address, *args):
@@ -415,7 +410,6 @@ class JamServer:
                 if idle >= self.silence_timeout:
                     log.info("User idle %.1fs ≥ %.1fs → /gen/status rest", idle, self.silence_timeout)
                     self.client.send_message("/gen/status", ["rest"])
-                    self._first_note_seen = False
                     idle_fired = True
             time.sleep(0.05)
 
@@ -544,6 +538,11 @@ class JamServer:
             now = time.time()
             if target_time > now:
                 time.sleep(target_time - now)
+            # fire "played" once, on the very first generated note of the session
+            if address == "/gen/noteon" and not self._first_note_seen:
+                self._first_note_seen = True
+                self.client.send_message("/gen/status", ["played"])
+                log.info("First generated note → /gen/status played")
             log.info("  → %s %s", address, args)
             self.client.send_message(address, args)
         log.info("Playback: done")
@@ -630,8 +629,8 @@ def main():
         client_ip     = client_ip,
         client_port   = client_port,
         window_size   = 4.0,
-        top_p         = 0.95,
-        temperature   = 1.0,
+        top_p         = 0.90,
+        temperature   = 0.8,
         shimonize= True
     )
     server.run()
