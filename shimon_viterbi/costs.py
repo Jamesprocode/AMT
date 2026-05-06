@@ -30,13 +30,13 @@ MEAN_BAR_WIDTH_MM = 29.0  # mean of diffs in NOTE_POSITIONS_MM
 
 # Hardware limits from pi-shimon/Include/Def.h
 VELOCITY_LIMIT_MM_PER_S = 2500.0   # VELOCITY_LIMIT = 2.5 m/s
-ACC_LIMIT_G = 3.0                  # ACC_LIMIT = 3 g
+ACC_LIMIT_G = 2.5                  # was 3.0; lowered to reduce overshoot.
 G_MM_PER_S2 = 9800.0               # 9.8 m/s^2 in mm/s^2
 
 # Safety margin: only schedule moves that fit within SAFETY_FACTOR of the
 # hardware limit. Anything tighter is treated as infeasible. Crash-avoidance
 # is always the highest priority in the cost ordering.
-SAFETY_FACTOR = 0.85
+SAFETY_FACTOR = 0.80
 
 
 @dataclass
@@ -50,8 +50,8 @@ class CostModel:
     # otherwise-equivalent paths. The robot is allowed to move more if that
     # means hitting more exact notes.
     alpha: float = 1.0           # emission weight (exact-pitch hit)
-    lambda_: float = 3.0         # perceptual penalty (>1 arm moved monophonically)
-    omega: float = 0.02          # efficiency penalty per bar-width moved (tie-breaker only)
+    lambda_: float = 1.5         # perceptual penalty (>1 arm moved monophonically)
+    omega: float = 0.2           # efficiency penalty per bar-width moved
     beta_octave: float = 2.0     # penalty per |octave| of fallback shift
     gamma_drop: float = 10.0     # penalty for skipping a note (rest fallback)
     velocity_mm_per_s: float = VELOCITY_LIMIT_MM_PER_S * SAFETY_FACTOR

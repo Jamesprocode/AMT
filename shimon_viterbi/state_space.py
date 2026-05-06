@@ -37,10 +37,10 @@ NUM_ARMS = 4
 # 0 — the rail extends past the extreme bars on hardware, so we don't need
 # to forbid arm 0 from mm=0 or arm 3 from mm=1385.
 ARM_GAPS: tuple[tuple[int, int], ...] = (
-    (0, 60),
-    (60, 180),
-    (180, 60),
-    (60, 0),
+    (0, 80),
+    (80, 200),
+    (200, 80),
+    (80, 0),
 )
 
 HOME_POSITIONS_MM: tuple[int, int, int, int] = (44, 434, 894, 1240)
