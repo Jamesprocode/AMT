@@ -15,6 +15,8 @@ Constants mirror pi-shimon/Include/Def.h:
 from dataclasses import dataclass
 from itertools import combinations
 
+import numpy as np
+
 
 # MIDI notes 48..95 -> slider mm position. The C++ table has 49 entries
 # (last one is a duplicate sentinel); we take the first 48.
@@ -123,6 +125,58 @@ class StateSpace:
         self._enumerate()
         if max_states_per_pitch > 0:
             self._prune_beams()
+        self._build_numpy_index()
+
+    # ------------------------------------------------------------------
+    # Numpy index — built once after enumeration. Used by viterbi_decode_np
+    # and CostModel.{emission_np, transition_np} for vectorized scoring.
+    # ------------------------------------------------------------------
+    def _build_numpy_index(self) -> None:
+        """Populate positions_array, state_to_idx, beam_idx_for_pitch.
+
+        positions_array : (N, 4) int64 array of arm positions, row-aligned
+                          with self.states.
+        state_to_idx    : State -> row index.
+        beam_idx_for_pitch[p] : np.ndarray (int64) of state indices whose
+                          configuration places an arm at pitch p — the
+                          numpy mirror of beam_for_pitch[p].
+        """
+        if not self.states:
+            self.positions_array = np.zeros((0, NUM_ARMS), dtype=np.int64)
+            self.state_pitches = np.zeros((0, NUM_ARMS), dtype=np.int64)
+            self.state_to_idx = {}
+            self.beam_idx_for_pitch = {
+                p: np.zeros((0,), dtype=np.int64)
+                for p in self.beam_for_pitch
+            }
+            return
+
+        self.positions_array = np.asarray(
+            [s.positions_mm for s in self.states], dtype=np.int64
+        )
+        # Precompute the MIDI pitch each arm strikes for each state.
+        self.state_pitches = np.asarray(
+            [s.struck_pitches for s in self.states], dtype=np.int64
+        )
+        self.state_to_idx = {s: i for i, s in enumerate(self.states)}
+        self.beam_idx_for_pitch = {
+            p: np.asarray([self.state_to_idx[s] for s in beam], dtype=np.int64)
+            for p, beam in self.beam_for_pitch.items()
+        }
+
+    def extended_beam_idx(self, pitch: int, octave_range: int = 2) -> np.ndarray:
+        """Numpy index version of extended_beam_fn — returns state indices."""
+        parts: list[np.ndarray] = []
+        for k in range(-octave_range, octave_range + 1):
+            shifted = pitch + 12 * k
+            if shifted < self.pitch_range[0] or shifted > self.pitch_range[1]:
+                continue
+            parts.append(self.beam_idx_for_pitch.get(
+                shifted, np.zeros((0,), dtype=np.int64)
+            ))
+        if not parts:
+            return np.zeros((0,), dtype=np.int64)
+        return np.concatenate(parts)
 
     def _prune_beams(self) -> None:
         """For each pitch, keep at most `max_states_per_pitch` configurations.

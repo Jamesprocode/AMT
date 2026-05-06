@@ -47,6 +47,7 @@ from anticipation.vocab import TIME_OFFSET, DUR_OFFSET, NOTE_OFFSET
 from anticipation.sample import generate
 
 from shimon_filter import filter_notes, octave_fold, expand_tremolo, nudge_runs, stagger_chords
+from shimon_viterbi import JamPlanner, PHRASE_LEAD_IN_S
 
 logging.basicConfig(
     level=logging.INFO,
@@ -234,6 +235,11 @@ class JamServer:
         run_interval_ms: float = 150.0,
         run_semitones: int = 3,
         shimonize: bool = True,
+        use_viterbi: bool = True,
+        viterbi_max_states_per_pitch: int = 50,
+        viterbi_beam_width: int = 100,
+        viterbi_octave_range: int = 2,
+        phrase_lead_in_s: float = PHRASE_LEAD_IN_S,
     ):
         log.info("Loading model from %s …", model_path)
         device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
@@ -265,6 +271,23 @@ class JamServer:
         self.run_interval_ms       = run_interval_ms
         self.run_semitones         = run_semitones
         self.shimonize             = shimonize
+        self.use_viterbi           = use_viterbi
+        self.phrase_lead_in_s      = phrase_lead_in_s
+
+        if self.use_viterbi:
+            log.info("Building Viterbi planner (max_states_per_pitch=%d, beam_width=%d) …",
+                     viterbi_max_states_per_pitch, viterbi_beam_width)
+            t0 = time.time()
+            self._planner = JamPlanner(
+                pitch_range=(pitch_lo, pitch_hi),
+                max_states_per_pitch=viterbi_max_states_per_pitch,
+                beam_width=viterbi_beam_width,
+                octave_range=viterbi_octave_range,
+            )
+            log.info("Planner ready (%d states, %.0f ms).",
+                     len(self._planner.state_space), (time.time() - t0) * 1000)
+        else:
+            self._planner = None
 
         self._running = False
         self._current_temperature = temperature
@@ -290,6 +313,9 @@ class JamServer:
         if self._running:
             log.info("Already running – ignoring /control/start")
             return
+        if self._planner is not None:
+            self._planner.reset()
+            log.info("Planner state reset to home.")
         self._running = True
         self.buffer.start()
         threading.Thread(target=self._generation_loop, daemon=True).start()
@@ -523,8 +549,22 @@ class JamServer:
             else:
                 log.info("  pipeline  shimonize=False – skipping transforms")
 
-            schedule = notes_to_schedule(decoded, play_start, phrase_dur)
-            t7 = time.time(); log.info("  pipeline  notes_to_sched : %5.3f ms", (t7-t1)*1e3)
+            if self._planner is not None:
+                schedule, planner_stats = self._planner.plan_and_schedule(
+                    decoded, play_start, win_start=phrase_dur,
+                    lead_in_s=self.phrase_lead_in_s,
+                )
+                t7 = time.time(); log.info(
+                    "  pipeline  viterbi_plan   : %5.3f ms  (notes=%d skipped=%d oct=%d score=%.2f)",
+                    (t7-t1)*1e3,
+                    planner_stats["n_notes"],
+                    planner_stats["n_skipped"],
+                    planner_stats["n_octave_shifts"],
+                    planner_stats["total_score"],
+                )
+            else:
+                schedule = notes_to_schedule(decoded, play_start, phrase_dur)
+                t7 = time.time(); log.info("  pipeline  notes_to_sched : %5.3f ms", (t7-t1)*1e3)
             threading.Thread(
                 target=self._playback_thread,
                 args=(schedule,),

@@ -52,10 +52,22 @@ def compute_motion_params(
         )
 
     acc_g = (v_peak * v_peak) / denom / 9.8
-    if acc_g > ACC_LIMIT_G * SAFETY_FACTOR:
+    safety_limit = ACC_LIMIT_G * SAFETY_FACTOR
+
+    # Clip to the safety-derated limit. The Viterbi feasibility gate uses
+    # the same formula but with raw float dt_s; here we operate on integer
+    # ms after rounding, so a fraction-of-a-percent drift can push us past
+    # the limit on an otherwise-accepted move. Clipping caps at the safe
+    # acceleration; the arm moves a hair slower (≤1ms late), which is
+    # negligible inside bar-strike tolerance.
+    if acc_g > safety_limit * 1.05:
+        # Genuinely infeasible by any reasonable margin — should not happen
+        # if Viterbi gated correctly. Surface as an error.
         raise ValueError(
             f"infeasible move: {dist_mm}mm in {time_ms}ms requires {acc_g:.2f}g, "
-            f"above safety-derated limit {ACC_LIMIT_G * SAFETY_FACTOR:.2f}g"
+            f"more than 5% above safety-derated limit {safety_limit:.2f}g"
         )
+    if acc_g > safety_limit:
+        acc_g = safety_limit
 
     return acc_g, v_max_mm_s

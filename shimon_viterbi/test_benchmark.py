@@ -15,7 +15,7 @@ from math import inf
 
 from costs import CostModel
 from state_space import StateSpace, State, NUM_ARMS, NOTE_POSITIONS_MM, MIN_NOTE, MAX_NOTE
-from viterbi import viterbi_decode
+from viterbi import viterbi_decode, viterbi_decode_np
 
 
 # --------------------------------------------------------------------------
@@ -141,6 +141,26 @@ def viterbi_plan(
         transition_fn=transition_fn,
         skip_score_fn=lambda s, p: cost_model.skip_score(s, p),
         beam_width=beam_width,
+    )
+
+
+def viterbi_plan_np(
+    melody: list[tuple[float, int]],
+    state_space: StateSpace,
+    cost_model: CostModel,
+    start_state: State,
+    octave_range: int = 2,
+    beam_width: int = 200,
+):
+    """Numpy-vectorized counterpart of `viterbi_plan`. Same semantics."""
+    return viterbi_decode_np(
+        observations=melody,
+        start_state=start_state,
+        state_space=state_space,
+        cost_model=cost_model,
+        beam_width=beam_width,
+        octave_range=octave_range,
+        allow_skip=True,
     )
 
 
@@ -312,32 +332,56 @@ def benchmark_one(name: str, melody: list[tuple[float, int]],
     g_path, g_skip, g_score = greedy_plan(melody, state_space, cost_model, start_state)
     g_time = time.perf_counter() - t0
 
-    # Viterbi.
+    # Viterbi (pure Python).
     t0 = time.perf_counter()
     v_result = viterbi_plan(melody, state_space, cost_model, start_state, beam_width=beam_width)
     v_time = time.perf_counter() - t0
 
-    # Apples-to-apples scoring uses the SAME CostModel for both paths.
+    # Viterbi (numpy-vectorized).
+    t0 = time.perf_counter()
+    vnp_result = viterbi_plan_np(melody, state_space, cost_model, start_state, beam_width=beam_width)
+    vnp_time = time.perf_counter() - t0
+
+    # Equivalence check between pure-Python and numpy decoders.
+    score_match = abs(v_result.total_score - vnp_result.total_score) < 1e-6
+    is_skip_match = list(v_result.is_skip) == list(vnp_result.is_skip)
+    path_match = v_result.path == vnp_result.path
+    equiv = "OK" if (score_match and is_skip_match) else "DIVERGE"
+    if not (score_match and is_skip_match):
+        equiv += (
+            f" [score py={v_result.total_score:.4f} np={vnp_result.total_score:.4f} "
+            f"is_skip_match={is_skip_match} path_match={path_match}]"
+        )
+
+    # Apples-to-apples scoring uses the SAME CostModel for all paths.
     print(f"\n=== {name} ({len(melody)} notes) ===")
-    print(f"             {'GREEDY':>10s}   {'VITERBI':>10s}")
-    print(f"  plan time  {g_time*1000:>8.2f}ms   {v_time*1000:>8.2f}ms")
+    print(f"             {'GREEDY':>10s}   {'VITERBI':>10s}   {'VITERBI_NP':>10s}")
+    print(f"  plan time  {g_time*1000:>8.2f}ms   {v_time*1000:>8.2f}ms   {vnp_time*1000:>8.2f}ms")
     print(f"  score      {g_score:>10.3f}   {v_result.total_score:>10.3f}   "
-          f"(viterbi - greedy = {v_result.total_score - g_score:+.3f})")
-    print(f"  skipped    {sum(g_skip):>10d}   {sum(v_result.is_skip):>10d}   (drops)")
+          f"{vnp_result.total_score:>10.3f}   "
+          f"(viterbi - greedy = {v_result.total_score - g_score:+.3f}; py vs np: {equiv})")
+    print(f"  skipped    {sum(g_skip):>10d}   {sum(v_result.is_skip):>10d}   "
+          f"{sum(vnp_result.is_skip):>10d}   (drops)")
     print(f"  oct shifts {num_octave_shifts(g_path, g_skip, pitches):>10d}   "
-          f"{num_octave_shifts(v_result.path, v_result.is_skip, pitches):>10d}   (excludes drops)")
+          f"{num_octave_shifts(v_result.path, v_result.is_skip, pitches):>10d}   "
+          f"{num_octave_shifts(vnp_result.path, vnp_result.is_skip, pitches):>10d}   (excludes drops)")
     print(f"  exact hits {len(pitches) - sum(g_skip) - num_octave_shifts(g_path, g_skip, pitches):>10d}   "
-          f"{len(pitches) - sum(v_result.is_skip) - num_octave_shifts(v_result.path, v_result.is_skip, pitches):>10d}")
+          f"{len(pitches) - sum(v_result.is_skip) - num_octave_shifts(v_result.path, v_result.is_skip, pitches):>10d}   "
+          f"{len(pitches) - sum(vnp_result.is_skip) - num_octave_shifts(vnp_result.path, vnp_result.is_skip, pitches):>10d}")
     print(f"  total mm   {total_arm_distance(g_path):>10d}   "
-          f"{total_arm_distance(v_result.path):>10d}")
+          f"{total_arm_distance(v_result.path):>10d}   "
+          f"{total_arm_distance(vnp_result.path):>10d}")
 
     return {
         "name": name,
         "n_notes": len(melody),
         "g_time_ms": g_time * 1000,
         "v_time_ms": v_time * 1000,
+        "vnp_time_ms": vnp_time * 1000,
         "g_score": g_score,
         "v_score": v_result.total_score,
+        "vnp_score": vnp_result.total_score,
+        "equiv_ok": score_match and is_skip_match,
     }
 
 
@@ -382,12 +426,20 @@ def main():
         results.append(benchmark_one(name, mel, ss, cm, start, beam_width=BEAM_WIDTH))
 
     print("\n=== summary ===")
-    print(f"{'melody':<22s} {'g_ms':>7s} {'v_ms':>8s} {'Δscore':>8s}  {'verdict'}")
+    print(f"{'melody':<35s} {'g_ms':>7s} {'v_ms':>8s} {'vnp_ms':>8s} {'speedup':>8s} "
+          f"{'Δscore':>8s}  {'verdict':>8s}  {'py=np?':>8s}")
     for r in results:
         delta = r["v_score"] - r["g_score"]
         better = "viterbi" if delta > 1e-6 else ("equal" if abs(delta) < 1e-6 else "greedy")
-        print(f"{r['name']:<22s} {r['g_time_ms']:>7.2f} {r['v_time_ms']:>8.2f} "
-              f"{delta:>+8.3f}  {better}")
+        speedup = r["v_time_ms"] / r["vnp_time_ms"] if r["vnp_time_ms"] > 0 else float("inf")
+        equiv = "OK" if r["equiv_ok"] else "DIVERGE"
+        print(f"{r['name']:<35s} {r['g_time_ms']:>7.2f} {r['v_time_ms']:>8.2f} "
+              f"{r['vnp_time_ms']:>8.2f} {speedup:>7.1f}x "
+              f"{delta:>+8.3f}  {better:>8s}  {equiv:>8s}")
+
+    n_diverge = sum(1 for r in results if not r["equiv_ok"])
+    print(f"\nEquivalence: {len(results) - n_diverge}/{len(results)} melodies match between "
+          f"pure-Python and numpy decoders (score within 1e-6, is_skip identical).")
 
 
 if __name__ == "__main__":
