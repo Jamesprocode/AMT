@@ -39,11 +39,19 @@ SAFETY_FACTOR = 0.85
 
 @dataclass
 class CostModel:
+    # Priority (strongest preference first):
+    #   1. exact pitch         : +alpha       = +1.0
+    #   2. ±1 octave shift     : alpha - β    =  -1.0
+    #   3. ±2 octave shift     : alpha - 2β   =  -3.0
+    #   4. drop note           : -γ           = -10.0   ← never unless infeasible
+    # Travel cost (omega) is small — only acts as a tie-breaker between
+    # otherwise-equivalent paths. The robot is allowed to move more if that
+    # means hitting more exact notes.
     alpha: float = 1.0           # emission weight (exact-pitch hit)
     lambda_: float = 0.5         # perceptual penalty (>1 arm moved monophonically)
-    omega: float = 0.1           # efficiency penalty per bar-width moved
-    beta_octave: float = 0.3     # penalty per |octave| of fallback shift
-    gamma_drop: float = 2.0      # penalty for skipping a note (rest fallback)
+    omega: float = 0.02          # efficiency penalty per bar-width moved (tie-breaker only)
+    beta_octave: float = 2.0     # penalty per |octave| of fallback shift
+    gamma_drop: float = 10.0     # penalty for skipping a note (rest fallback)
     velocity_mm_per_s: float = VELOCITY_LIMIT_MM_PER_S * SAFETY_FACTOR
     acc_g: float = ACC_LIMIT_G * SAFETY_FACTOR
 
@@ -51,14 +59,20 @@ class CostModel:
     # Eq 1 — emission (with octave fallback)
     # ------------------------------------------------------------------
     def emission(self, state: State, pitch: int) -> float:
-        struck = state.struck_pitch
-        diff = struck - pitch
-        if diff == 0:
-            return self.alpha
-        if diff % 12 != 0:
-            return -inf
-        octaves = abs(diff) // 12
-        return self.alpha - octaves * self.beta_octave
+        # Each configuration reaches up to 4 pitches (one per arm). Pick the
+        # best-matching one: exact > 1-octave shift > 2-octave shift > etc.
+        best = -inf
+        for struck in state.struck_pitches:
+            diff = struck - pitch
+            if diff == 0:
+                return self.alpha  # exact match wins immediately
+            if diff % 12 != 0:
+                continue
+            octaves = abs(diff) // 12
+            score = self.alpha - octaves * self.beta_octave
+            if score > best:
+                best = score
+        return best
 
     # ------------------------------------------------------------------
     # Skip score — chosen by Viterbi when no feasible hit is reachable.

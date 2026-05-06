@@ -63,16 +63,16 @@ def test_ascending_triad():
     print(f"beam sizes: C4={len(ss.beam_fn(60))}, E4={len(ss.beam_fn(64))}, G4={len(ss.beam_fn(67))}")
     print(f"path ({len(result.path)} states):")
     for t, (state, pitch) in enumerate(zip(result.path, [60, 64, 67])):
-        match = "OK" if state.struck_pitch == pitch else "MISS"
-        print(f"  step {t}: {state} -> plays MIDI {state.struck_pitch} (target {pitch}) [{match}]")
+        match = "OK" if pitch in state.struck_pitches else "MISS"
+        print(f"  step {t}: {state} -> reaches {state.struck_pitches} (target {pitch}) [{match}]")
     print(f"total score: {result.total_score:.3f}")
     print(f"skipped: {result.skipped}")
 
-    # Correctness: each returned state must play the target pitch (no skips, no octave shift).
+    # Correctness: each returned state must reach the target pitch (no skips, no octave shift).
     for state, pitch, was_skip in zip(result.path, [60, 64, 67], result.is_skip):
         assert not was_skip, f"step should not be skipped"
-        assert state.struck_pitch == pitch, \
-            f"state plays {state.struck_pitch}, expected {pitch}"
+        assert pitch in state.struck_pitches, \
+            f"state reaches {state.struck_pitches}, expected to include {pitch}"
     # Total score should be positive (3 emission hits dominate small efficiency penalty).
     assert result.total_score > 0
     assert result.skipped == []
@@ -97,12 +97,12 @@ def test_octave_fallback_when_pitch_unreachable():
     # The test asserts the path strikes pitch 60 (octave-shifted hit) instead of skipping.
     melody = [(0.0, 60), (0.4, 72)]
     ss, result = plan_melody(melody, pitch_range=(60, 71), octave_range=2)
-    print(f"octave fallback path: {[(s.struck_pitch, sk) for s, sk in zip(result.path, result.is_skip)]}")
-    # Step 1's struck pitch should be 60 (the only pitch class reachable that's
-    # an octave-multiple of 72 in [60,71]). Crucially, NOT skipped.
+    print(f"octave fallback path: {[(s.struck_pitches, sk) for s, sk in zip(result.path, result.is_skip)]}")
+    # Step 1's reachable pitches must include 60 (the only pitch class reachable
+    # that's an octave-multiple of 72 in [60,71]). Crucially, NOT skipped.
     assert result.is_skip == [False, False], f"got is_skip={result.is_skip}"
-    assert result.path[1].struck_pitch == 60, \
-        f"expected fallback to 60, got {result.path[1].struck_pitch}"
+    assert 60 in result.path[1].struck_pitches, \
+        f"expected fallback reachable pitches to include 60, got {result.path[1].struck_pitches}"
 
 
 def test_skip_chosen_when_unreachable():
@@ -110,7 +110,7 @@ def test_skip_chosen_when_unreachable():
     range, the only option is skip. Path should remain at start_state."""
     melody = [(0.0, 60), (0.3, 100)]
     ss, result = plan_melody(melody, pitch_range=(60, 71), octave_range=0)
-    print(f"skip path: {[(s.struck_pitch if not sk else 'SKIP', sk) for s, sk in zip(result.path, result.is_skip)]}")
+    print(f"skip path: {[(s.struck_pitches if not sk else 'SKIP', sk) for s, sk in zip(result.path, result.is_skip)]}")
     assert result.is_skip[0] is False
     assert result.is_skip[1] is True
     assert result.path[1] == result.path[0], "skip should keep arms at previous state"

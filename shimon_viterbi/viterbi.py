@@ -32,6 +32,12 @@ class ViterbiResult:
     is_skip: list[bool]               # per-step flag: True if this step's state was a skip
 
 
+def _prune_to_top_k(V: dict, k: int) -> dict:
+    """Keep only the top-k entries by score. Used for beamed Viterbi pruning."""
+    top = sorted(V.items(), key=lambda kv: kv[1], reverse=True)[:k]
+    return dict(top)
+
+
 def viterbi_decode(
     observations: Sequence[Obs],
     start_state: State,
@@ -39,6 +45,7 @@ def viterbi_decode(
     emission_fn: Callable[[State, Obs], float],
     transition_fn: Callable[[State, State, int], float],
     skip_score_fn: Optional[Callable[[State, Obs], float]] = None,
+    beam_width: int = 0,
 ) -> ViterbiResult:
     """Decode the best state sequence for a given observation sequence.
 
@@ -48,6 +55,10 @@ def viterbi_decode(
     skip_score_fn(state, obs)          -> score added when the path "stays at
                                            state" instead of striking obs.
                                            If None, skipping is not allowed.
+    beam_width                         -> if > 0, after each step retain only
+                                           the top-K states in V by score.
+                                           Implements beamed Viterbi (Bretan
+                                           2017 Fig. 9). 0 = no pruning.
 
     step_idx is passed to transition_fn so the caller can look up dt from
     its own observation timing if needed.
@@ -84,6 +95,9 @@ def viterbi_decode(
                 first_S[start_state] = True
     P.append(first_P)
     S.append(first_S)
+
+    if beam_width > 0 and len(V) > beam_width:
+        V = _prune_to_top_k(V, beam_width)
 
     skipped: list[int] = []
 
@@ -133,6 +147,9 @@ def viterbi_decode(
         V = V_new
         P.append(P_new)
         S.append(S_new)
+
+        if beam_width > 0 and len(V) > beam_width:
+            V = _prune_to_top_k(V, beam_width)
 
         if V and all(S_new.get(s, False) for s in V):
             skipped.append(t)

@@ -1,11 +1,13 @@
 """
 Monophonic Shimon state space.
 
-A state captures: four arm mm-positions (strictly increasing, respecting
-inter-arm gap constraints) plus a striker id in {0,1,2,3} identifying
-which arm strikes the target pitch.
+A state captures: four arm mm-positions, strictly increasing, respecting
+inter-arm gap constraints. The striker for a given target pitch is
+implicit — whichever arm sits at that pitch's bar position. Matches the
+representation in Bretan 2017 thesis Ch. III ("about 73,815 possible arm
+configurations").
 
-Constants mirror ShimonController/Include/Def.h:
+Constants mirror pi-shimon/Include/Def.h:
   - kNotePositionTable: mm positions for MIDI notes 48..95 (48 entries).
   - kBoundaries: per-arm {left_gap, right_gap} in mm.
 """
@@ -69,11 +71,23 @@ def gap_ok(left_arm: int, right_arm: int, left_pos: int, right_pos: int) -> bool
 @dataclass(frozen=True)
 class State:
     positions_mm: tuple[int, int, int, int]  # arm 0..3, strictly increasing
-    striker: int                              # which arm strikes (0..3)
 
     @property
-    def struck_pitch(self) -> int:
-        return mm_to_pitch(self.positions_mm[self.striker])
+    def struck_pitches(self) -> tuple[int, int, int, int]:
+        """The four pitches reachable from this configuration (one per arm)."""
+        return tuple(mm_to_pitch(p) for p in self.positions_mm)
+
+    def striker_for(self, pitch: int) -> int | None:
+        """Index of the arm sitting at `pitch`, or None if no arm is there.
+
+        Because positions_mm is strictly increasing, at most one arm can
+        match — so the answer (if it exists) is unique.
+        """
+        target_mm = pitch_to_mm(pitch)
+        for i, p in enumerate(self.positions_mm):
+            if p == target_mm:
+                return i
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -87,22 +101,60 @@ class StateSpace:
     for keeping the state space small during testing.
     """
 
-    def __init__(self, pitch_range: tuple[int, int] = (MIN_NOTE, MAX_NOTE)):
+    def __init__(
+        self,
+        pitch_range: tuple[int, int] = (MIN_NOTE, MAX_NOTE),
+        max_states_per_pitch: int = 0,
+    ):
+        """
+        max_states_per_pitch : if > 0, retain only this many configurations
+        per pitch in beam_for_pitch[p]. Selected to span the rail evenly so
+        the planner still has flexibility in placing passive arms. 0 = no cap.
+        """
         lo, hi = pitch_range
         assert MIN_NOTE <= lo <= hi <= MAX_NOTE
         self.pitch_range = (lo, hi)
+        self.max_states_per_pitch = max_states_per_pitch
         self._bar_indices = tuple(range(lo - MIN_NOTE, hi - MIN_NOTE + 1))
         self.states: list[State] = []
         self.beam_for_pitch: dict[int, list[State]] = {
             p: [] for p in range(lo, hi + 1)
         }
         self._enumerate()
+        if max_states_per_pitch > 0:
+            self._prune_beams()
+
+    def _prune_beams(self) -> None:
+        """For each pitch, keep at most `max_states_per_pitch` configurations.
+
+        Selection criterion: prefer configurations where passive arms are
+        spread as evenly as possible across the rail (i.e., minimize the
+        variance of inter-arm gaps). This keeps the planner's options open
+        because passive arms aren't all clustered at one end.
+        """
+        K = self.max_states_per_pitch
+        for pitch in list(self.beam_for_pitch.keys()):
+            states = self.beam_for_pitch[pitch]
+            if len(states) <= K:
+                continue
+            # Score each by how evenly spread the arms are. Lower = more even.
+            def spread_score(s: State) -> float:
+                gaps = [
+                    s.positions_mm[i + 1] - s.positions_mm[i]
+                    for i in range(NUM_ARMS - 1)
+                ]
+                mean = sum(gaps) / len(gaps)
+                return sum((g - mean) ** 2 for g in gaps)
+            sorted_states = sorted(states, key=spread_score)
+            self.beam_for_pitch[pitch] = sorted_states[:K]
 
     def _enumerate(self) -> None:
         positions = NOTE_POSITIONS_MM
 
         # Choose 4 bar positions (strictly increasing via combinations) that
-        # satisfy the three pairwise gap constraints.
+        # satisfy the three pairwise gap constraints. Each configuration is
+        # registered under all 4 of its arm pitches so beam_for_pitch[P]
+        # returns every config in which some arm sits at P.
         for combo in combinations(self._bar_indices, NUM_ARMS):
             p0, p1, p2, p3 = (positions[i] for i in combo)
             if not gap_ok(0, 1, p0, p1):
@@ -113,10 +165,12 @@ class StateSpace:
                 continue
 
             pos_tuple = (p0, p1, p2, p3)
-            for striker in range(NUM_ARMS):
-                state = State(positions_mm=pos_tuple, striker=striker)
-                self.states.append(state)
-                self.beam_for_pitch[state.struck_pitch].append(state)
+            state = State(positions_mm=pos_tuple)
+            self.states.append(state)
+            for arm_pos in pos_tuple:
+                pitch = mm_to_pitch(arm_pos)
+                if pitch in self.beam_for_pitch:
+                    self.beam_for_pitch[pitch].append(state)
 
     def __len__(self) -> int:
         return len(self.states)
@@ -141,7 +195,7 @@ class StateSpace:
 
 
 def home_state() -> State:
-    """A canonical start state at the C++ home positions. Striker 0 by default."""
+    """A canonical start state at the C++ home positions."""
     # Home positions 0 and 1385 are exact bar positions (MIDI 48 and 95).
     # 50 and 1345 are NOT bar positions; snap to nearest bars for a valid state.
     def snap_to_bar(mm: int) -> int:
@@ -150,4 +204,4 @@ def home_state() -> State:
     snapped = tuple(snap_to_bar(p) for p in HOME_POSITIONS_MM)
     # Enforce strictly increasing after snapping (should already be true).
     assert snapped[0] < snapped[1] < snapped[2] < snapped[3], snapped
-    return State(positions_mm=snapped, striker=0)
+    return State(positions_mm=snapped)
